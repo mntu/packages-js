@@ -1,0 +1,30 @@
+name: Publish Hardware Keys
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  hardware-keys:
+    uses: ./.github/workflows/hardware-keys.yml
+    with:
+      publish: true
+    secrets:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    permissions:
+      contents: read
+      id-token: write

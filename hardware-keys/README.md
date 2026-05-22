@@ -1,15 +1,11 @@
-# @mntu/hardware-keys
+# hardware-keys
 
-Native bindings for hardware key backends used by mntu: YubiKey PIV and macOS Secure Enclave. Built with [napi-rs](https://napi.rs/) and shipped as prebuilt binaries for macOS (Apple Silicon + Intel), Linux x86_64, and Windows x86_64.
-
-Part of [mntu/packages-js](https://github.com/mntu/packages-js)
-
-> Most users do not depend on this package directly. It is loaded as an optional dependency of [`@mntu/local-keys`](../local-keys), which provides a higher-level API with automatic key resolution and fallback to software keys.
+Native bindings for hardware key backends used by: YubiKey PIV and macOS Secure Enclave. Built with [napi-rs](https://napi.rs/) and shipped as prebuilt binaries for macOS (Apple Silicon + Intel), Linux x86_64, and Windows x86_64.
 
 ## Install
 
 ```bash
-npm install @mntu/hardware-keys
+npm install hardware-keys
 ```
 
 The right prebuilt binary for your platform is selected automatically. If no prebuilt is available, key operations on hardware backends will be unavailable but the package will still load.
@@ -24,7 +20,7 @@ The right prebuilt binary for your platform is selected automatically. If no pre
 ## API
 
 ```ts
-import { discover, generateKey, signHash, listKeys, deleteKey } from '@mntu/hardware-keys'
+import { discover, generateKey, signHash, listKeys, deleteKey } from 'hardware-keys'
 
 // Discover available hardware backends
 const backends = discover()
@@ -32,15 +28,18 @@ const backends = discover()
 
 // Generate a key on a backend
 //
-// YubiKey: label, permanent, replaceIfExists are ignored (slot 9e is fixed)
+// YubiKey: label, permanent, requireBiometric, replaceIfExists are ignored (slot 9e is fixed)
 const key = generateKey('yubikey-piv', 'ES256')
 
-// Secure Enclave: label is required; permanent defaults to false (ephemeral, process-lifetime only);
-// replaceIfExists defaults to false (throws if label already exists)
+// Secure Enclave: label is required; other params default to false
 const key = generateKey('secure-enclave', 'ES256', 'com.myapp.signing-key')
-const key = generateKey('secure-enclave', 'ES256', 'com.myapp.signing-key', true)              // persist to keychain
-const key = generateKey('secure-enclave', 'ES256', 'com.myapp.signing-key', false, true)       // replace if exists
+const key = generateKey('secure-enclave', 'ES256', 'com.myapp.signing-key', true)               // persist to keychain
+const key = generateKey('secure-enclave', 'ES256', 'com.myapp.signing-key', true, false)        // no biometric
+const key = generateKey('secure-enclave', 'ES256', 'com.myapp.signing-key', true, true)         // require Touch ID on every sign
+const key = generateKey('secure-enclave', 'ES256', 'com.myapp.signing-key', true, false, true)  // replace if exists
 // { backend, keyId, algorithm, publicJwk }
+// Note: if label already exists in keychain and replaceIfExists = false,
+// the existing key is loaded into the in-process cache and returned as-is (get-or-create).
 
 // Sign a SHA-256 hash with an existing key
 const result = signHash('yubikey-piv', '9e', hashBuffer)
@@ -69,7 +68,8 @@ deleteKey('yubikey-piv', '9e')
 | `algorithm` | `string` | ✓ | — | `"ES256"` or `"RS256"` (YubiKey only) |
 | `label` | `string` | SE only | — | Application label used for lookup and deletion |
 | `permanent` | `boolean` | — | `false` | Persist key to keychain. Requires binary codesigned with `keychain-access-groups` entitlement |
-| `replaceIfExists` | `boolean` | — | `false` | Delete existing key with the same label before creating. If `false`, throws on duplicate |
+| `requireBiometric` | `boolean` | — | `false` | Require Touch ID / Face ID on every signing operation (`kSecAccessControlBiometryAny`). When `false`, the key is usable programmatically with no user interaction |
+| `replaceIfExists` | `boolean` | — | `false` | Delete existing key with the same label before creating. If `false` and label exists in keychain, the existing key is loaded and returned (get-or-create) |
 
 ### Notes on Secure Enclave persistence
 
@@ -142,7 +142,8 @@ const key = generateKey(
   'ES256',
   'com.myapp.signing-key',
   true,   // permanent — persisted to keychain across restarts
-  false,  // replaceIfExists
+  false,  // requireBiometric — no Touch ID prompt (programmatic access)
+  false,  // replaceIfExists — load existing key if already in keychain (get-or-create)
 )
 
 // On next process start, the key is still available:

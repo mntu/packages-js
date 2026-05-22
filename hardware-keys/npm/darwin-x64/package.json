@@ -1,5 +1,5 @@
 {
-  "name": "@mntu/hardware-keys-darwin-x64",
+  "name": "hardware-keys-darwin-x64",
   "version": "0.11.3",
   "os": [
     "darwin"
@@ -13,9 +13,5 @@
     "se-helper"
   ],
   "description": "Hardware key backends for macOS x64 native binary",
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/mntu/packages-js"
-  }
+  "license": "MIT"
 }

@@ -46,12 +46,10 @@ pub struct SignatureResult {
 pub fn discover() -> Vec<HardwareKeyInfo> {
     let mut backends = Vec::new();
 
-    // Check for YubiKey
     if let Some(info) = yubikey_piv::discover() {
         backends.push(info);
     }
 
-    // Check for Secure Enclave (macOS only)
     #[cfg(target_os = "macos")]
     if let Some(info) = secure_enclave::discover() {
         backends.push(info);
@@ -63,20 +61,26 @@ pub fn discover() -> Vec<HardwareKeyInfo> {
 /// Generate a key on the specified backend.
 ///
 /// # Parameters (Secure Enclave only)
-/// - `label`           – Key label stored as `kSecAttrApplicationLabel`. Required for
-///                       Secure Enclave; ignored for YubiKey (slot is fixed to 9e).
-/// - `permanent`       – Persist to keychain (`kSecAttrIsPermanent`). Requires the
-///                       binary to be codesigned with `keychain-access-groups`.
-///                       Ignored for YubiKey.
-/// - `replace_if_exists` – When `true` and `label` already exists, the old key is
-///                       deleted before creating a new one. When `false` the call
-///                       returns an error on duplicate labels. Ignored for YubiKey.
+/// - `label`              – Key label stored as `kSecAttrApplicationLabel`. Required for
+///                          Secure Enclave; ignored for YubiKey (slot is fixed to 9e).
+/// - `permanent`          – Persist to keychain (`kSecAttrIsPermanent`). Requires the
+///                          binary to be codesigned with `keychain-access-groups`.
+///                          Ignored for YubiKey.
+/// - `require_biometric`  – When `true`, Touch ID / Face ID is prompted on every signing
+///                          operation (`kSecAccessControlBiometryAny`). When `false`,
+///                          the key is usable programmatically with no user interaction.
+///                          Ignored for YubiKey.
+/// - `replace_if_exists`  – When `true` and `label` already exists, the old key is
+///                          deleted before creating a new one. When `false` and the key
+///                          already exists in the keychain it is loaded into the
+///                          in-process cache and returned as-is. Ignored for YubiKey.
 #[napi]
 pub fn generate_key(
     backend: String,
     algorithm: String,
     label: Option<String>,
     permanent: Option<bool>,
+    require_biometric: Option<bool>,
     replace_if_exists: Option<bool>,
 ) -> Result<GeneratedKey> {
     match backend.as_str() {
@@ -88,12 +92,13 @@ pub fn generate_key(
                 Error::from_reason("'label' is required for the secure-enclave backend")
             })?;
             let permanent = permanent.unwrap_or(false);
+            let require_biometric = require_biometric.unwrap_or(false);
             let policy = if replace_if_exists.unwrap_or(false) {
                 secure_enclave::DuplicateLabelPolicy::Replace
             } else {
                 secure_enclave::DuplicateLabelPolicy::Error
             };
-            secure_enclave::generate_key(&label, &algorithm, permanent, policy)
+            secure_enclave::generate_key(&label, &algorithm, permanent, require_biometric, policy)
         }
 
         _ => Err(Error::from_reason(format!("Unknown backend: {}", backend))),

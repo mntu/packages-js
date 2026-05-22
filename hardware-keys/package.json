@@ -1,5 +1,5 @@
 {
-  "name": "@mntu/hardware-keys",
+  "name": "hardware-keys",
   "version": "0.11.3",
   "description": "Hardware key backends for YubiKey PIV and macOS Secure Enclave",
   "main": "index.js",
@@ -18,21 +18,28 @@
     ]
   },
   "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/mntu/packages-js"
-  },
   "scripts": {
     "build": "napi build --platform --release",
     "build:debug": "napi build --platform"
   },
+  "keywords": [
+    "yubikey",
+    "secure-enclave",
+    "keychain",
+    "keystore",
+    "hardware-security",
+    "macos",
+    "biometric",
+    "signing",
+    "crypto"
+  ],
   "devDependencies": {
     "@napi-rs/cli": "^2.18.0"
   },
   "optionalDependencies": {
-    "@mntu/hardware-keys-darwin-arm64": "0.11.2",
-    "@mntu/hardware-keys-darwin-x64": "0.11.2",
-    "@mntu/hardware-keys-linux-x64-gnu": "0.11.2",
-    "@mntu/hardware-keys-win32-x64-msvc": "0.11.2"
+    "hardware-keys-darwin-arm64": "0.11.3",
+    "hardware-keys-darwin-x64": "0.11.3",
+    "hardware-keys-linux-x64-gnu": "0.11.3",
+    "hardware-keys-win32-x64-msvc": "0.11.3"
   }
 }

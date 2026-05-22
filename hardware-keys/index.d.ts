@@ -38,16 +38,21 @@ export declare function discover(): Array<HardwareKeyInfo>
  * Generate a key on the specified backend.
  *
  * # Parameters (Secure Enclave only)
- * - `label`           – Key label stored as `kSecAttrApplicationLabel`. Required for
- *                       Secure Enclave; ignored for YubiKey (slot is fixed to 9e).
- * - `permanent`       – Persist to keychain (`kSecAttrIsPermanent`). Requires the
- *                       binary to be codesigned with `keychain-access-groups`.
- *                       Ignored for YubiKey.
- * - `replace_if_exists` – When `true` and `label` already exists, the old key is
- *                       deleted before creating a new one. When `false` the call
- *                       returns an error on duplicate labels. Ignored for YubiKey.
+ * - `label`              – Key label stored as `kSecAttrApplicationLabel`. Required for
+ *                          Secure Enclave; ignored for YubiKey (slot is fixed to 9e).
+ * - `permanent`          – Persist to keychain (`kSecAttrIsPermanent`). Requires the
+ *                          binary to be codesigned with `keychain-access-groups`.
+ *                          Ignored for YubiKey.
+ * - `require_biometric`  – When `true`, Touch ID / Face ID is prompted on every signing
+ *                          operation (`kSecAccessControlBiometryAny`). When `false`,
+ *                          the key is usable programmatically with no user interaction.
+ *                          Ignored for YubiKey.
+ * - `replace_if_exists`  – When `true` and `label` already exists, the old key is
+ *                          deleted before creating a new one. When `false` and the key
+ *                          already exists in the keychain it is loaded into the
+ *                          in-process cache and returned as-is. Ignored for YubiKey.
  */
-export declare function generateKey(backend: string, algorithm: string, label?: string | undefined | null, permanent?: boolean | undefined | null, replaceIfExists?: boolean | undefined | null): GeneratedKey
+export declare function generateKey(backend: string, algorithm: string, label?: string | undefined | null, permanent?: boolean | undefined | null, requireBiometric?: boolean | undefined | null, replaceIfExists?: boolean | undefined | null): GeneratedKey
 /**
  * Sign a hash with a hardware key.
  * For JWT: pass the SHA-256 hash of the `header.payload` string.

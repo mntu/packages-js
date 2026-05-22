@@ -1,5 +1,5 @@
 {
-  "name": "@mntu/hardware-keys-win32-x64-msvc",
+  "name": "hardware-keys-win32-x64-msvc",
   "version": "0.11.3",
   "os": [
     "win32"
@@ -12,9 +12,5 @@
     "index.win32-x64-msvc.node"
   ],
   "description": "Hardware key backends for Windows x64 (MSVC) native binary",
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/mntu/packages-js"
-  }
+  "license": "MIT"
 }

@@ -62,21 +62,25 @@ pub fn discover() -> Option<HardwareKeyInfo> {
 /// Generate a P-256 key in the Secure Enclave.
 ///
 /// # Parameters
-/// - `label`       – Application label stored as `kSecAttrApplicationLabel`. Must be unique
-///                   per key; used for subsequent `sign_hash` / `delete_key` lookups.
-/// - `algorithm`   – Only `"ES256"` is supported.
-/// - `permanent`   – When `true` the key is written to the keychain
-///                   (`kSecAttrIsPermanent = true`). Requires the binary to be
-///                   codesigned with the `keychain-access-groups` entitlement;
-///                   without it the Security framework returns
-///                   `errSecMissingEntitlement (-34018)`. Pass `false` for
-///                   non-codesigned binaries (e.g. plain `node`).
-/// - `on_duplicate` – Controls behaviour when `label` is already known (either
-///                    in the in-process cache or in the keychain).
+/// - `label`              – Application label stored as `kSecAttrApplicationLabel`. Must be unique
+///                          per key; used for subsequent `sign_hash` / `delete_key` lookups.
+/// - `algorithm`          – Only `"ES256"` is supported.
+/// - `permanent`          – When `true` the key is written to the keychain
+///                          (`kSecAttrIsPermanent = true`). Requires the binary to be
+///                          codesigned with the `keychain-access-groups` entitlement;
+///                          without it the Security framework returns
+///                          `errSecMissingEntitlement (-34018)`. Pass `false` for
+///                          non-codesigned binaries (e.g. plain `node`).
+/// - `require_biometric`  – When `true`, Touch ID / Face ID is required every time this key
+///                          is used for signing (`kSecAccessControlBiometryAny`). When `false`,
+///                          the key is accessible programmatically with no user interaction.
+/// - `on_duplicate`       – Controls behaviour when `label` is already known (either
+///                          in the in-process cache or in the keychain).
 pub fn generate_key(
     label: &str,
     algorithm: &str,
     permanent: bool,
+    require_biometric: bool,
     on_duplicate: DuplicateLabelPolicy,
 ) -> Result<GeneratedKey> {
     if algorithm != "ES256" {
@@ -99,15 +103,28 @@ pub fn generate_key(
                 delete_key(label)?;
             }
             DuplicateLabelPolicy::Error => {
-                return Err(Error::from_reason(format!(
-                    "A key with label '{}' already exists",
-                    label
-                )));
+                // Key exists in keychain but may not be in the in-process cache yet
+                // (e.g. after app restart). Load it into cache and return it.
+                let private_key = load_se_key(label)?;
+                let public_key = private_key
+                    .public_key()
+                    .ok_or_else(|| Error::from_reason("Failed to extract public key"))?;
+                let public_jwk = se_pubkey_to_jwk(&public_key)?;
+                SE_KEYS
+                    .lock()
+                    .map_err(|e| Error::from_reason(format!("Lock error: {}", e)))?
+                    .insert(label.to_string(), private_key);
+                return Ok(GeneratedKey {
+                    backend: "secure-enclave".to_string(),
+                    key_id: label.to_string(),
+                    algorithm: "ES256".to_string(),
+                    public_jwk,
+                });
             }
         }
     }
 
-    let private_key = create_se_key(label, permanent)?;
+    let private_key = create_se_key(label, permanent, require_biometric)?;
 
     let public_key = private_key
         .public_key()
@@ -204,35 +221,38 @@ pub fn list_keys(prefix: Option<&str>) -> Result<Vec<GeneratedKey>> {
 
     // errSecItemNotFound (-25300) simply means no permanent keys exist yet.
     if status == 0 && !result.is_null() {
-        let array = unsafe {
-            core_foundation::array::CFArray::<core_foundation::base::CFType>::wrap_under_create_rule(
-                result as *mut _,
-            )
-        };
+        // SecItemCopyMatching may return a single SecKey ref or a CFArray depending
+        // on how many items match. Always normalize to a Vec<SecKey> before iterating.
+        let type_id = unsafe { core_foundation::base::CFGetTypeID(result) };
+        let array_type_id = core_foundation::array::CFArray::<core_foundation::base::CFType>::type_id();
 
-        for item in array.iter() {
-            // Each item is a SecKey ref. Wrap it and extract the public key.
-            let sec_key = unsafe {
-                SecKey::wrap_under_get_rule(
-                    item.as_CFTypeRef() as *mut _
+        let sec_keys: Vec<SecKey> = if type_id == array_type_id {
+            let array = unsafe {
+                core_foundation::array::CFArray::<core_foundation::base::CFType>::wrap_under_create_rule(
+                    result as *mut _,
                 )
             };
+            array
+                .iter()
+                .map(|item| unsafe {
+                    SecKey::wrap_under_get_rule(item.as_CFTypeRef() as *mut _)
+                })
+                .collect()
+        } else {
+            // Single item returned — wrap directly
+            vec![unsafe { SecKey::wrap_under_create_rule(result as *mut _) }]
+        };
 
+        for sec_key in sec_keys {
             if let Some(pub_key) = sec_key.public_key() {
                 if let Ok(public_jwk) = se_pubkey_to_jwk(&pub_key) {
-                    // We cannot reliably recover the label from the SecKey ref without
-                    // an additional SecItemCopyMatching with kSecReturnAttributes, so
-                    // we use the JWK thumbprint as a fallback key_id here.
-                    // Callers who need the original label should use the in-process cache.
                     let key_id = jwk_thumbprint_id(&public_jwk);
-
                     let entry = GeneratedKey {
                         backend: "secure-enclave".to_string(),
                         key_id,
                         algorithm: "ES256".to_string(),
                         public_jwk,
                     };
-
                     if prefix.map_or(true, |p| entry.key_id.starts_with(p)) {
                         keys.push(entry);
                     }
@@ -340,18 +360,65 @@ pub fn delete_key(label: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Create a P-256 key in the Secure Enclave via Security.framework
-fn create_se_key(label: &str, permanent: bool) -> Result<SecKey> {
+fn create_se_key(label: &str, permanent: bool, require_biometric: bool) -> Result<SecKey> {
+    use core_foundation::base::CFType;
+
     let label_data = CFData::from_buffer(label.as_bytes());
 
-    // Private key attributes
-    // Note: kSecAttrIsPermanent = false for non-codesigned binaries (like node)
-    // because errSecMissingEntitlement (-34018) prevents keychain persistence.
-    // The key lives only for the process lifetime. For persistent SE keys,
-    // the binary must be codesigned with keychain-access-groups entitlement.
     let is_permanent = if permanent {
         CFBoolean::true_value()
     } else {
         CFBoolean::false_value()
+    };
+
+    // Build access control flags based on biometric requirement.
+    // kSecAccessControlPrivateKeyUsage is always set so the key can be used
+    // for signing inside the Secure Enclave.
+    // kSecAccessControlBiometryAny additionally requires Touch ID / Face ID.
+    let access_control: CFType = {
+        extern "C" {
+            fn SecAccessControlCreateWithFlags(
+                allocator: core_foundation_sys::base::CFAllocatorRef,
+                protection: core_foundation_sys::base::CFTypeRef,
+                flags: u64,
+                error: *mut core_foundation_sys::error::CFErrorRef,
+            ) -> core_foundation_sys::base::CFTypeRef;
+
+            static kSecAttrAccessibleWhenUnlockedThisDeviceOnly:
+                core_foundation_sys::string::CFStringRef;
+        }
+
+        // kSecAccessControlPrivateKeyUsage = 1 << 30
+        // kSecAccessControlBiometryAny     = 1 << 1
+        let flags: u64 = if require_biometric {
+            (1 << 30) | (1 << 1)
+        } else {
+            1 << 30
+        };
+
+        let mut error: core_foundation_sys::error::CFErrorRef = std::ptr::null_mut();
+        let acl = unsafe {
+            SecAccessControlCreateWithFlags(
+                std::ptr::null(),
+                kSecAttrAccessibleWhenUnlockedThisDeviceOnly as core_foundation_sys::base::CFTypeRef,
+                flags,
+                &mut error,
+            )
+        };
+
+        if acl.is_null() {
+            let msg = if !error.is_null() {
+                let cf_err = unsafe {
+                    core_foundation::error::CFError::wrap_under_create_rule(error)
+                };
+                format!("SecAccessControlCreateWithFlags failed: {}", cf_err.description())
+            } else {
+                "SecAccessControlCreateWithFlags failed (unknown error)".to_string()
+            };
+            return Err(Error::from_reason(msg));
+        }
+
+        unsafe { CFType::wrap_under_create_rule(acl) }
     };
 
     let private_key_attrs = CFDictionary::from_CFType_pairs(&[
@@ -362,6 +429,10 @@ fn create_se_key(label: &str, permanent: bool) -> Result<SecKey> {
         (
             unsafe { CFString::wrap_under_get_rule(kSecAttrApplicationLabel) },
             label_data.as_CFType(),
+        ),
+        (
+            CFString::new("accc"), // kSecAttrAccessControl
+            access_control,
         ),
     ]);
 

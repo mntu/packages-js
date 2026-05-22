@@ -195,7 +195,7 @@ jobs:
               echo "Skipping hardware-keys-$pkg@$VERSION (already published)"
             else
               echo "Publishing hardware-keys-$pkg@$VERSION (npm has $published)..."
-              (cd hardware-keys/npm/$pkg && npm publish --provenance --access public)
+              (cd hardware-keys/npm/$pkg && npm publish --access public)
             fi
           done
 
@@ -210,5 +210,5 @@ jobs:
           else
             echo "Publishing hardware-keys@$VERSION (npm has $published)..."
             cd hardware-keys
-            npm publish --provenance --access public
+            npm publish --access public
           fi

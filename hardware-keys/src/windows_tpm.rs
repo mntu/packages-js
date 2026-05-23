@@ -255,7 +255,7 @@ pub fn delete_key(label: &str) -> Result<()> {
 
     unsafe {
         // NCryptDeleteKey frees the handle itself — do not call NCryptFreeObject after
-        NCryptDeleteKey(key_handle, NCRYPT_FLAGS(0))
+        NCryptDeleteKey(key_handle, 0)
             .map_err(|e| Error::from_reason(format!("NCryptDeleteKey failed: {}", e)))?;
     }
 

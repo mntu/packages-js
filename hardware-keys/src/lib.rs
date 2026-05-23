@@ -151,7 +151,16 @@ pub fn list_keys(backend: String, prefix: Option<String>) -> Result<Vec<Generate
         #[cfg(target_os = "macos")]
         "secure-enclave" => secure_enclave::list_keys(prefix.as_deref()),
         #[cfg(target_os = "windows")]
-        "windows-tpm" => windows_tpm::list_keys(),
+        "windows-tpm" => {
+            // prefix filter is not supported for windows-tpm — CNG does not provide
+            // a prefix query API; all hwkey- keys are returned and filtered here if needed
+            let keys = windows_tpm::list_keys()?;
+            if let Some(p) = prefix.as_deref() {
+                Ok(keys.into_iter().filter(|k| k.key_id.starts_with(p)).collect())
+            } else {
+                Ok(keys)
+            }
+        }
         _ => Err(Error::from_reason(format!("Unknown backend: {}", backend))),
     }
 }

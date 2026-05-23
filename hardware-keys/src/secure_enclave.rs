@@ -268,14 +268,18 @@ pub fn list_keys(prefix: Option<&str>) -> Result<Vec<GeneratedKey>> {
 
     for (label, sec_key) in cache.iter() {
         if prefix.map_or(true, |p| label.starts_with(p)) {
-            // Skip if already found via keychain (avoid duplicates).
-            let already_listed = keys.iter().any(|k| &k.key_id == label);
-            if already_listed {
-                continue;
-            }
-
+            // Skip if already found via keychain — compare by publicJwk since
+            // keychain entries use a thumbprint key_id, not the original label.
             if let Some(pub_key) = sec_key.public_key() {
                 if let Ok(public_jwk) = se_pubkey_to_jwk(&pub_key) {
+                    let already_listed = keys.iter().any(|k| k.public_jwk == public_jwk);
+                    if already_listed {
+                        // Update the key_id of the existing entry to the real label
+                        if let Some(entry) = keys.iter_mut().find(|k| k.public_jwk == public_jwk) {
+                            entry.key_id = label.clone();
+                        }
+                        continue;
+                    }
                     keys.push(GeneratedKey {
                         backend: "secure-enclave".to_string(),
                         key_id: label.clone(),

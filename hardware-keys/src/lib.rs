@@ -6,6 +6,9 @@ mod yubikey_piv;
 #[cfg(target_os = "macos")]
 mod secure_enclave;
 
+#[cfg(target_os = "windows")]
+mod windows_tpm;
+
 /// Discovered hardware key backend
 #[napi(object)]
 pub struct HardwareKeyInfo {
@@ -55,6 +58,11 @@ pub fn discover() -> Vec<HardwareKeyInfo> {
         backends.push(info);
     }
 
+    #[cfg(target_os = "windows")]
+    if let Some(info) = windows_tpm::discover() {
+        backends.push(info);
+    }
+
     backends
 }
 
@@ -101,6 +109,20 @@ pub fn generate_key(
             secure_enclave::generate_key(&label, &algorithm, permanent, require_biometric, policy)
         }
 
+        #[cfg(target_os = "windows")]
+        "windows-tpm" => {
+            let label = label.ok_or_else(|| {
+                Error::from_reason("'label' is required for the windows-tpm backend")
+            })?;
+            let require_biometric = require_biometric.unwrap_or(false);
+            let policy = if replace_if_exists.unwrap_or(false) {
+                windows_tpm::DuplicateLabelPolicy::Replace
+            } else {
+                windows_tpm::DuplicateLabelPolicy::Error
+            };
+            windows_tpm::generate_key(&label, &algorithm, require_biometric, policy)
+        }
+
         _ => Err(Error::from_reason(format!("Unknown backend: {}", backend))),
     }
 }
@@ -113,6 +135,8 @@ pub fn sign_hash(backend: String, key_id: String, hash: Buffer) -> Result<Signat
         "yubikey-piv" => yubikey_piv::sign_hash(&key_id, &hash),
         #[cfg(target_os = "macos")]
         "secure-enclave" => secure_enclave::sign_hash(&key_id, &hash),
+        #[cfg(target_os = "windows")]
+        "windows-tpm" => windows_tpm::sign_hash(&key_id, &hash),
         _ => Err(Error::from_reason(format!("Unknown backend: {}", backend))),
     }
 }
@@ -126,6 +150,8 @@ pub fn list_keys(backend: String, prefix: Option<String>) -> Result<Vec<Generate
         "yubikey-piv" => yubikey_piv::list_keys(),
         #[cfg(target_os = "macos")]
         "secure-enclave" => secure_enclave::list_keys(prefix.as_deref()),
+        #[cfg(target_os = "windows")]
+        "windows-tpm" => windows_tpm::list_keys(),
         _ => Err(Error::from_reason(format!("Unknown backend: {}", backend))),
     }
 }
@@ -140,6 +166,8 @@ pub fn delete_key(backend: String, label: String) -> Result<()> {
         "yubikey-piv" => yubikey_piv::delete_key(&label),
         #[cfg(target_os = "macos")]
         "secure-enclave" => secure_enclave::delete_key(&label),
+        #[cfg(target_os = "windows")]
+        "windows-tpm" => windows_tpm::delete_key(&label),
         _ => Err(Error::from_reason(format!("Unknown backend: {}", backend))),
     }
 }

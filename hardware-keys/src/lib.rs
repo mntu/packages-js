@@ -83,6 +83,7 @@ pub fn discover() -> Vec<HardwareKeyInfo> {
 ///                          already exists in the keychain it is loaded into the
 ///                          in-process cache and returned as-is. Ignored for YubiKey.
 #[napi]
+#[allow(unused_variables)]
 pub fn generate_key(
     backend: String,
     algorithm: String,

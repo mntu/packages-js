@@ -88,7 +88,7 @@ pub fn generate_key(
     if require_biometric {
         let policy = NCRYPT_UI_POLICY {
             dwVersion: 1,
-            dwFlags: NCRYPT_UI_PROTECT_KEY_FLAG,
+            dwFlags: NCRYPT_UI_FORCE_HIGH_PROTECTION_FLAG,
             pszCreationTitle: PCWSTR::null(),
             pszFriendlyName: PCWSTR::null(),
             pszDescription: PCWSTR::null(),

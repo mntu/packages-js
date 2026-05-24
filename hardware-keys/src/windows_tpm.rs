@@ -10,6 +10,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use napi::bindgen_prelude::*;
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Security::Cryptography::*;
+use windows::Win32::Security::OBJECT_SECURITY_INFORMATION;
 
 use crate::{GeneratedKey, HardwareKeyInfo, SignatureResult};
 
@@ -70,7 +71,7 @@ pub fn discover() -> Option<HardwareKeyInfo> {
                     4,
                 )),
                 &mut cb,
-                0, // dwFlags: u32
+                OBJECT_SECURITY_INFORMATION(0),
             ).is_ok() && (impl_type & 1 != 0);
 
             // Always clean up the probe key

@@ -23,6 +23,14 @@ pub enum DuplicateLabelPolicy {
 
 /// Check if TPM 2.0 is available via CNG Platform Crypto Provider
 pub fn discover() -> Option<HardwareKeyInfo> {
+    // Step 1: check TPM is present and enabled via WMI Win32_Tpm
+    // NCRYPT_UI_FORCE_HIGH_PROTECTION_FLAG only works with real TPM hardware —
+    // if we allow fallback to software provider, biometric won't work correctly.
+    if !is_tpm_available() {
+        return None;
+    }
+
+    // Step 2: verify the Platform Crypto Provider is accessible
     let mut provider = NCRYPT_PROV_HANDLE::default();
     let status = unsafe {
         NCryptOpenStorageProvider(
@@ -34,7 +42,51 @@ pub fn discover() -> Option<HardwareKeyInfo> {
     if status.is_err() {
         return None;
     }
+
+    // Step 3: verify a test key creation actually lands in TPM, not software fallback.
+    // Create a temporary key and check its NCRYPT_IMPL_TYPE_PROPERTY.
+    // NCRYPT_IMPL_HARDWARE_FLAG = 1 means TPM-backed.
+    let mut test_key = NCRYPT_KEY_HANDLE::default();
+    let test_name = HSTRING::from("hwkey-discover-probe");
+    let in_tpm = unsafe {
+        let ok = NCryptCreatePersistedKey(
+            provider,
+            &mut test_key,
+            &HSTRING::from("ECDSA_P256"),
+            &test_name,
+            CERT_KEY_SPEC(0),
+            NCRYPT_FLAGS(0),
+        ).is_ok()
+        && NCryptFinalizeKey(test_key, NCRYPT_FLAGS(0)).is_ok();
+
+        if ok {
+            let mut impl_type: u32 = 0;
+            let mut cb: u32 = 4;
+            let is_hw = NCryptGetProperty(
+                test_key,
+                &HSTRING::from("Impl Type"), // NCRYPT_IMPL_TYPE_PROPERTY
+                Some(std::slice::from_raw_parts_mut(
+                    &mut impl_type as *mut u32 as *mut u8,
+                    4,
+                )),
+                &mut cb,
+                NCRYPT_FLAGS(0),
+            ).is_ok() && (impl_type & 1 != 0); // NCRYPT_IMPL_HARDWARE_FLAG = 1
+
+            // Always clean up the probe key
+            let _ = NCryptDeleteKey(test_key, 0);
+            is_hw
+        } else {
+            let _ = NCryptFreeObject(test_key);
+            false
+        }
+    };
+
     unsafe { let _ = NCryptFreeObject(provider); }
+
+    if !in_tpm {
+        return None;
+    }
 
     Some(HardwareKeyInfo {
         backend: "windows-tpm".to_string(),
@@ -42,6 +94,76 @@ pub fn discover() -> Option<HardwareKeyInfo> {
         algorithms: vec!["ES256".to_string()],
         device_id: "local".to_string(),
     })
+}
+
+/// Check TPM presence via WMI Win32_Tpm before attempting CNG operations.
+/// Returns false if TPM is absent, disabled, or not owned.
+fn is_tpm_available() -> bool {
+    use windows::Win32::System::Wmi::*;
+    use windows::Win32::System::Com::*;
+
+    unsafe {
+        // Initialize COM
+        let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+        if hr.is_err() && hr != windows::Win32::Foundation::RPC_E_CHANGED_MODE {
+            return false;
+        }
+
+        let locator: IWbemLocator = match CoCreateInstance(
+            &WbemLocator,
+            None,
+            CLSCTX_INPROC_SERVER,
+        ) {
+            Ok(l) => l,
+            Err(_) => return false,
+        };
+
+        let server = match locator.ConnectServer(
+            &windows::core::BSTR::from("ROOT\\CIMV2\\Security\\MicrosoftTpm"),
+            None, None, None, 0, None, None,
+        ) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+
+        let query = match server.ExecQuery(
+            &windows::core::BSTR::from("WQL"),
+            &windows::core::BSTR::from("SELECT IsEnabled_InitialValue FROM Win32_Tpm"),
+            WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+            None,
+        ) {
+            Ok(q) => q,
+            Err(_) => return false,
+        };
+
+        let mut row = [None; 1];
+        let mut returned = 0i32;
+        if query.Next(WBEM_INFINITE as i32, &mut row, &mut returned).is_err()
+            || returned == 0
+        {
+            return false;
+        }
+
+        let obj = match &row[0] {
+            Some(o) => o.clone(),
+            None => return false,
+        };
+
+        let mut variant = windows::Win32::System::Variant::VARIANT::default();
+        if obj.Get(
+            windows::core::w!("IsEnabled_InitialValue"),
+            0,
+            &mut variant,
+            None,
+            None,
+        ).is_err() {
+            return false;
+        }
+
+        // VT_BOOL = 11, TRUE = -1 in VARIANT
+        variant.as_raw().Anonymous.Anonymous.vt == 11
+            && variant.as_raw().Anonymous.Anonymous.Anonymous.boolVal == -1i16
+    }
 }
 
 /// Generate a P-256 key in the TPM.

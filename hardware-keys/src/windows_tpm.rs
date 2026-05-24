@@ -52,74 +52,23 @@ pub fn discover() -> Option<HardwareKeyInfo> {
     })
 }
 
-/// Check TPM presence via WMI Win32_Tpm before attempting CNG operations.
-/// Returns false if TPM is absent, disabled, or not owned.
+/// Check TPM presence by attempting to open the Microsoft Platform Crypto Provider.
+/// This provider only loads successfully when backed by real TPM 2.0 hardware.
 fn is_tpm_available() -> bool {
-    use windows::Win32::System::Wmi::*;
-    use windows::Win32::System::Com::*;
-
-    unsafe {
-        // Initialize COM
-        let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
-        if hr.is_err() && hr != windows::Win32::Foundation::RPC_E_CHANGED_MODE {
-            return false;
-        }
-
-        let locator: IWbemLocator = match CoCreateInstance(
-            &WbemLocator,
-            None,
-            CLSCTX_INPROC_SERVER,
-        ) {
-            Ok(l) => l,
-            Err(_) => return false,
-        };
-
-        let server = match locator.ConnectServer(
-            &windows::core::BSTR::from("ROOT\\CIMV2\\Security\\MicrosoftTpm"),
-            None, None, None, 0, None, None,
-        ) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-
-        let query = match server.ExecQuery(
-            &windows::core::BSTR::from("WQL"),
-            &windows::core::BSTR::from("SELECT IsEnabled_InitialValue FROM Win32_Tpm"),
-            WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
-            None,
-        ) {
-            Ok(q) => q,
-            Err(_) => return false,
-        };
-
-        let mut row = [None; 1];
-        let mut returned = 0u32;
-        if query.Next(WBEM_INFINITE as i32, &mut row, &mut returned as *mut u32).is_err()
-            || returned == 0
-        {
-            return false;
-        }
-
-        let obj = match &row[0] {
-            Some(o) => o.clone(),
-            None => return false,
-        };
-
-        let mut variant = windows::core::VARIANT::default();
-        if obj.Get(
-            windows::core::w!("IsEnabled_InitialValue"),
+    let mut provider = NCRYPT_PROV_HANDLE::default();
+    let ok = unsafe {
+        NCryptOpenStorageProvider(
+            &mut provider,
+            &HSTRING::from(MS_PLATFORM_CRYPTO_PROVIDER),
             0,
-            &mut variant,
-            None,
-            None,
-        ).is_err() {
-            return false;
-        }
-
-        // Extract bool value from VARIANT
-        matches!(variant.as_raw().Anonymous.Anonymous.vt, 11)
-            && variant.as_raw().Anonymous.Anonymous.Anonymous.boolVal == -1i16
+        ).is_ok()
+    };
+    if ok {
+        unsafe { let _ = NCryptFreeObject(provider); }
+    } else {
+        eprintln!("[windows-tpm] is_tpm_available: NCryptOpenStorageProvider failed");
     }
+    ok
 }
 
 /// Generate a P-256 key in the TPM.

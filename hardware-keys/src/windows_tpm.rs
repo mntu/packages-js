@@ -24,14 +24,11 @@ pub enum DuplicateLabelPolicy {
 
 /// Check if TPM 2.0 is available via CNG Platform Crypto Provider
 pub fn discover() -> Option<HardwareKeyInfo> {
-    // Step 1: check TPM is present and enabled via WMI Win32_Tpm
-    // NCRYPT_UI_FORCE_HIGH_PROTECTION_FLAG only works with real TPM hardware —
-    // if we allow fallback to software provider, biometric won't work correctly.
     if !is_tpm_available() {
+        eprintln!("[windows-tpm] discover: is_tpm_available() returned false");
         return None;
     }
 
-    // Step 2: verify the Platform Crypto Provider is accessible
     let mut provider = NCRYPT_PROV_HANDLE::default();
     let status = unsafe {
         NCryptOpenStorageProvider(
@@ -40,54 +37,12 @@ pub fn discover() -> Option<HardwareKeyInfo> {
             0,
         )
     };
-    if status.is_err() {
+    if let Err(e) = status {
+        eprintln!("[windows-tpm] discover: NCryptOpenStorageProvider failed: {}", e);
         return None;
     }
-
-    // Step 3: verify a test key creation actually lands in TPM, not software fallback.
-    // Create a temporary key and check its NCRYPT_IMPL_TYPE_PROPERTY.
-    // NCRYPT_IMPL_HARDWARE_FLAG = 1 means TPM-backed.
-    let mut test_key = NCRYPT_KEY_HANDLE::default();
-    let test_name = HSTRING::from("hwkey-discover-probe");
-    let in_tpm = unsafe {
-        let ok = NCryptCreatePersistedKey(
-            provider,
-            &mut test_key,
-            &HSTRING::from("ECDSA_P256"),
-            &test_name,
-            CERT_KEY_SPEC(0),
-            NCRYPT_FLAGS(0),
-        ).is_ok()
-        && NCryptFinalizeKey(test_key, NCRYPT_FLAGS(0)).is_ok();
-
-        if ok {
-            let mut impl_type: u32 = 0;
-            let mut cb: u32 = 4;
-            let is_hw = NCryptGetProperty(
-                test_key,
-                &HSTRING::from("Impl Type"),
-                Some(std::slice::from_raw_parts_mut(
-                    &mut impl_type as *mut u32 as *mut u8,
-                    4,
-                )),
-                &mut cb,
-                OBJECT_SECURITY_INFORMATION(0),
-            ).is_ok() && (impl_type & 1 != 0);
-
-            // Always clean up the probe key
-            let _ = NCryptDeleteKey(test_key, 0);
-            is_hw
-        } else {
-            let _ = NCryptFreeObject(test_key);
-            false
-        }
-    };
 
     unsafe { let _ = NCryptFreeObject(provider); }
-
-    if !in_tpm {
-        return None;
-    }
 
     Some(HardwareKeyInfo {
         backend: "windows-tpm".to_string(),

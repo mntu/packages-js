@@ -10,7 +10,6 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use napi::bindgen_prelude::*;
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Security::Cryptography::*;
-use windows::Win32::Security::OBJECT_SECURITY_INFORMATION;
 
 use crate::{GeneratedKey, HardwareKeyInfo, SignatureResult};
 

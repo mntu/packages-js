@@ -64,14 +64,14 @@ pub fn discover() -> Option<HardwareKeyInfo> {
             let mut cb: u32 = 4;
             let is_hw = NCryptGetProperty(
                 test_key,
-                &HSTRING::from("Impl Type"), // NCRYPT_IMPL_TYPE_PROPERTY
+                &HSTRING::from("Impl Type"),
                 Some(std::slice::from_raw_parts_mut(
                     &mut impl_type as *mut u32 as *mut u8,
                     4,
                 )),
                 &mut cb,
-                NCRYPT_FLAGS(0),
-            ).is_ok() && (impl_type & 1 != 0); // NCRYPT_IMPL_HARDWARE_FLAG = 1
+                0, // dwFlags: u32
+            ).is_ok() && (impl_type & 1 != 0);
 
             // Always clean up the probe key
             let _ = NCryptDeleteKey(test_key, 0);
@@ -137,8 +137,8 @@ fn is_tpm_available() -> bool {
         };
 
         let mut row = [None; 1];
-        let mut returned = 0i32;
-        if query.Next(WBEM_INFINITE as i32, &mut row, &mut returned).is_err()
+        let mut returned = 0u32;
+        if query.Next(WBEM_INFINITE as i32, &mut row, &mut returned as *mut u32).is_err()
             || returned == 0
         {
             return false;
@@ -149,7 +149,7 @@ fn is_tpm_available() -> bool {
             None => return false,
         };
 
-        let mut variant = windows::Win32::System::Variant::VARIANT::default();
+        let mut variant = windows::core::VARIANT::default();
         if obj.Get(
             windows::core::w!("IsEnabled_InitialValue"),
             0,
@@ -160,8 +160,8 @@ fn is_tpm_available() -> bool {
             return false;
         }
 
-        // VT_BOOL = 11, TRUE = -1 in VARIANT
-        variant.as_raw().Anonymous.Anonymous.vt == 11
+        // Extract bool value from VARIANT
+        matches!(variant.as_raw().Anonymous.Anonymous.vt, 11)
             && variant.as_raw().Anonymous.Anonymous.Anonymous.boolVal == -1i16
     }
 }

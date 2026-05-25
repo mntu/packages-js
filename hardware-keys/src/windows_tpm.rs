@@ -21,27 +21,44 @@ pub enum DuplicateLabelPolicy {
     Error,
 }
 
-/// Check if TPM 2.0 is available via CNG Platform Crypto Provider
+// ---------------------------------------------------------------------------
+// RAII handle wrapper — mirrors enclaveapp-windows/provider.rs NcryptHandle
+// ---------------------------------------------------------------------------
+
+struct NcryptHandle(NCRYPT_HANDLE);
+
+impl NcryptHandle {
+    fn as_prov(&self) -> NCRYPT_PROV_HANDLE {
+        NCRYPT_PROV_HANDLE(self.0 .0)
+    }
+
+    fn as_key(&self) -> NCRYPT_KEY_HANDLE {
+        NCRYPT_KEY_HANDLE(self.0 .0)
+    }
+}
+
+impl Drop for NcryptHandle {
+    fn drop(&mut self) {
+        if self.0 .0 != 0 {
+            unsafe {
+                let _ = NCryptFreeObject(self.0);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Check if TPM 2.0 is available via CNG Platform Crypto Provider.
+/// The Microsoft Platform Crypto Provider only opens successfully when
+/// backed by real TPM 2.0 hardware — no software fallback.
 pub fn discover() -> Option<HardwareKeyInfo> {
-    if !is_tpm_available() {
-        eprintln!("[windows-tpm] discover: is_tpm_available() returned false");
+    if open_provider().is_err() {
+        eprintln!("[windows-tpm] discover: NCryptOpenStorageProvider failed");
         return None;
     }
-
-    let mut provider = NCRYPT_PROV_HANDLE::default();
-    let status = unsafe {
-        NCryptOpenStorageProvider(
-            &mut provider,
-            &HSTRING::from(MS_PLATFORM_CRYPTO_PROVIDER),
-            0,
-        )
-    };
-    if let Err(e) = status {
-        eprintln!("[windows-tpm] discover: NCryptOpenStorageProvider failed: {}", e);
-        return None;
-    }
-
-    unsafe { let _ = NCryptFreeObject(provider); }
 
     Some(HardwareKeyInfo {
         backend: "windows-tpm".to_string(),
@@ -51,26 +68,18 @@ pub fn discover() -> Option<HardwareKeyInfo> {
     })
 }
 
-/// Check TPM presence by attempting to open the Microsoft Platform Crypto Provider.
-/// This provider only loads successfully when backed by real TPM 2.0 hardware.
-fn is_tpm_available() -> bool {
-    let mut provider = NCRYPT_PROV_HANDLE::default();
-    let ok = unsafe {
-        NCryptOpenStorageProvider(
-            &mut provider,
-            &HSTRING::from(MS_PLATFORM_CRYPTO_PROVIDER),
-            0,
-        ).is_ok()
-    };
-    if ok {
-        unsafe { let _ = NCryptFreeObject(provider); }
-    } else {
-        eprintln!("[windows-tpm] is_tpm_available: NCryptOpenStorageProvider failed");
-    }
-    ok
-}
-
 /// Generate a P-256 key in the TPM.
+///
+/// # Parameters
+/// - `label`              – Key name stored in CNG as `hwkey-<label>`.
+/// - `algorithm`          – Only `"ES256"` is supported.
+/// - `require_biometric`  – When `true`, sets `NCRYPT_UI_FORCE_HIGH_PROTECTION_FLAG`
+///                          requiring Windows Hello authentication before every signing
+///                          operation. Key creation fails rather than silently creating
+///                          an unprotected key if the policy cannot be applied.
+/// - `on_duplicate`       – Controls behaviour when a key with the same label already
+///                          exists in the TPM. `Error` performs get-or-create (returns
+///                          the existing key); `Replace` deletes and re-creates.
 pub fn generate_key(
     label: &str,
     algorithm: &str,
@@ -88,6 +97,7 @@ pub fn generate_key(
     if tpm_key_exists(&key_name)? {
         match on_duplicate {
             DuplicateLabelPolicy::Replace => delete_key(label)?,
+            // get-or-create: return existing key
             DuplicateLabelPolicy::Error => return load_and_export_key(&key_name, label),
         }
     }
@@ -97,32 +107,43 @@ pub fn generate_key(
 
     unsafe {
         NCryptCreatePersistedKey(
-            provider,
+            provider.as_prov(),
             &mut key_handle,
             &HSTRING::from("ECDSA_P256"),
             &HSTRING::from(key_name.as_str()),
             CERT_KEY_SPEC(0),
             NCRYPT_FLAGS(0),
         )
-        .map_err(|e| {
-            let _ = NCryptFreeObject(provider);
-            Error::from_reason(format!("NCryptCreatePersistedKey failed: {}", e))
-        })?;
+        .map_err(|e| Error::from_reason(format!("NCryptCreatePersistedKey failed: {}", e)))?;
     }
 
-    // Set Windows Hello UI policy if biometric requested
+    // Wrap immediately so handle is freed on any early return
+    let key = NcryptHandle(NCRYPT_HANDLE(key_handle.0));
+
+    // Set Windows Hello UI policy if biometric requested.
+    // NCRYPT_UI_FORCE_HIGH_PROTECTION_FLAG prompts Windows Hello on every sign,
+    // not on key creation. Fail hard rather than silently create an unprotected key.
     if require_biometric {
+        // These strings are shown in the Windows Hello prompt UI.
+        // Must be kept alive for the duration of NCryptSetProperty.
+        let creation_title: Vec<u16> = "Hardware Key Authentication\0"
+            .encode_utf16().collect();
+        let friendly_name: Vec<u16> = format!("hwkey-{}\0", label)
+            .encode_utf16().collect();
+        let description: Vec<u16> = "Windows Hello is required to use this key\0"
+            .encode_utf16().collect();
+
         let policy = NCRYPT_UI_POLICY {
             dwVersion: 1,
             dwFlags: NCRYPT_UI_FORCE_HIGH_PROTECTION_FLAG,
-            pszCreationTitle: PCWSTR::null(),
-            pszFriendlyName: PCWSTR::null(),
-            pszDescription: PCWSTR::null(),
+            pszCreationTitle: PCWSTR(creation_title.as_ptr()),
+            pszFriendlyName: PCWSTR(friendly_name.as_ptr()),
+            pszDescription: PCWSTR(description.as_ptr()),
         };
 
-        let result = unsafe {
+        unsafe {
             NCryptSetProperty(
-                key_handle,
+                key.as_key(),
                 &HSTRING::from("UI Policy"),
                 std::slice::from_raw_parts(
                     &policy as *const _ as *const u8,
@@ -130,35 +151,25 @@ pub fn generate_key(
                 ),
                 NCRYPT_FLAGS(0),
             )
-        };
-
-        if result.is_err() {
-            unsafe {
-                let _ = NCryptFreeObject(key_handle);
-                let _ = NCryptFreeObject(provider);
-            }
-            return Err(Error::from_reason(format!(
-                "Failed to set Windows Hello UI policy: {}. \
-                 TPM key creation aborted to avoid creating unprotected key.",
-                result.unwrap_err()
-            )));
+            .map_err(|e| {
+                Error::from_reason(format!(
+                    "Failed to set Windows Hello UI policy: {}. \
+                     TPM key creation aborted to avoid creating unprotected key.",
+                    e
+                ))
+            })?;
         }
+
+        // Explicitly keep the string buffers alive past NCryptSetProperty
+        drop((creation_title, friendly_name, description));
     }
 
     unsafe {
-        NCryptFinalizeKey(key_handle, NCRYPT_FLAGS(0)).map_err(|e| {
-            let _ = NCryptFreeObject(key_handle);
-            let _ = NCryptFreeObject(provider);
-            Error::from_reason(format!("NCryptFinalizeKey failed: {}", e))
-        })?;
+        NCryptFinalizeKey(key.as_key(), NCRYPT_FLAGS(0))
+            .map_err(|e| Error::from_reason(format!("NCryptFinalizeKey failed: {}", e)))?;
     }
 
-    let public_jwk = export_public_jwk(key_handle)?;
-
-    unsafe {
-        let _ = NCryptFreeObject(key_handle);
-        let _ = NCryptFreeObject(provider);
-    }
+    let public_jwk = export_public_jwk(&key)?;
 
     Ok(GeneratedKey {
         backend: "windows-tpm".to_string(),
@@ -169,17 +180,16 @@ pub fn generate_key(
 }
 
 /// Sign a SHA-256 hash with a TPM key.
-/// NCryptSignHash returns a P1363 signature (r||s, 64 bytes) directly.
+/// CNG returns a P1363 signature (r ‖ s, 64 bytes) directly for ECDSA — no padding info needed.
 pub fn sign_hash(key_id: &str, hash: &[u8]) -> Result<SignatureResult> {
     let key_name = format!("{}{}", KEY_NAME_PREFIX, key_id);
-    let key_handle = open_key(&key_name)?;
+    let key = open_key(&key_name)?;
 
+    // First call: query required signature buffer size
     let mut sig_len: u32 = 0;
-
-    // First call: get required buffer size
     unsafe {
         NCryptSignHash(
-            key_handle,
+            key.as_key(),
             None,
             hash,
             None,
@@ -191,10 +201,10 @@ pub fn sign_hash(key_id: &str, hash: &[u8]) -> Result<SignatureResult> {
 
     let mut sig_buf = vec![0u8; sig_len as usize];
 
-    // Second call: actual sign
+    // Second call: actual sign — Windows Hello prompt fires here if biometric policy is set
     unsafe {
         NCryptSignHash(
-            key_handle,
+            key.as_key(),
             None,
             hash,
             Some(&mut sig_buf),
@@ -205,8 +215,6 @@ pub fn sign_hash(key_id: &str, hash: &[u8]) -> Result<SignatureResult> {
     }
 
     sig_buf.truncate(sig_len as usize);
-
-    unsafe { let _ = NCryptFreeObject(key_handle); }
 
     Ok(SignatureResult {
         signature: sig_buf.into(),
@@ -225,7 +233,7 @@ pub fn list_keys() -> Result<Vec<GeneratedKey>> {
 
         let status = unsafe {
             NCryptEnumKeys(
-                provider,
+                provider.as_prov(),
                 PCWSTR::null(),
                 &mut key_name_ptr,
                 &mut enum_state,
@@ -237,8 +245,7 @@ pub fn list_keys() -> Result<Vec<GeneratedKey>> {
             Ok(_) => {
                 if !key_name_ptr.is_null() {
                     let name = unsafe {
-                        (*key_name_ptr).pszName.to_string()
-                            .unwrap_or_default()
+                        (*key_name_ptr).pszName.to_string().unwrap_or_default()
                     };
                     unsafe { let _ = NCryptFreeBuffer(key_name_ptr as *mut _); }
 
@@ -250,38 +257,31 @@ pub fn list_keys() -> Result<Vec<GeneratedKey>> {
                 }
             }
             Err(e) if e.code() == windows::Win32::Foundation::NTE_NO_MORE_ITEMS.into() => break,
-            Err(e) => {
-                unsafe {
-                    if !enum_state.is_null() {
-                        let _ = NCryptFreeBuffer(enum_state);
-                    }
-                    let _ = NCryptFreeObject(provider);
-                }
-                return Err(Error::from_reason(format!("NCryptEnumKeys failed: {}", e)));
-            }
+            Err(_) => break, // any other error ends enumeration gracefully
         }
     }
 
-    unsafe {
-        if !enum_state.is_null() {
-            let _ = NCryptFreeBuffer(enum_state);
-        }
-        let _ = NCryptFreeObject(provider);
+    if !enum_state.is_null() {
+        unsafe { let _ = NCryptFreeBuffer(enum_state); }
     }
 
     Ok(keys)
 }
 
 /// Delete a TPM key by label.
+/// Note: `NCryptDeleteKey` takes ownership of the handle and frees it — do NOT wrap in NcryptHandle.
 pub fn delete_key(label: &str) -> Result<()> {
     let key_name = format!("{}{}", KEY_NAME_PREFIX, label);
-    let key_handle = open_key(&key_name).map_err(|_| {
+    let key = open_key(&key_name).map_err(|_| {
         Error::from_reason(format!("Key not found for label: '{}'", label))
     })?;
 
+    // NCryptDeleteKey takes ownership — must not let NcryptHandle drop call NCryptFreeObject again
+    let raw = key.as_key();
+    std::mem::forget(key);
+
     unsafe {
-        // NCryptDeleteKey frees the handle itself — do not call NCryptFreeObject after
-        NCryptDeleteKey(key_handle, 0)
+        NCryptDeleteKey(raw, 0)
             .map_err(|e| Error::from_reason(format!("NCryptDeleteKey failed: {}", e)))?;
     }
 
@@ -292,7 +292,7 @@ pub fn delete_key(label: &str) -> Result<()> {
 // Private helpers
 // ---------------------------------------------------------------------------
 
-fn open_provider() -> Result<NCRYPT_PROV_HANDLE> {
+fn open_provider() -> Result<NcryptHandle> {
     let mut provider = NCRYPT_PROV_HANDLE::default();
     unsafe {
         NCryptOpenStorageProvider(
@@ -302,46 +302,36 @@ fn open_provider() -> Result<NCRYPT_PROV_HANDLE> {
         )
         .map_err(|e| Error::from_reason(format!("NCryptOpenStorageProvider failed: {}", e)))?;
     }
-    Ok(provider)
+    Ok(NcryptHandle(NCRYPT_HANDLE(provider.0)))
 }
 
-fn open_key(key_name: &str) -> Result<NCRYPT_KEY_HANDLE> {
+fn open_key(key_name: &str) -> Result<NcryptHandle> {
     let provider = open_provider()?;
     let mut key_handle = NCRYPT_KEY_HANDLE::default();
 
-    let result = unsafe {
+    unsafe {
         NCryptOpenKey(
-            provider,
+            provider.as_prov(),
             &mut key_handle,
             &HSTRING::from(key_name),
             CERT_KEY_SPEC(0),
             NCRYPT_SILENT_FLAG,
         )
-    };
+        .map_err(|e| {
+            Error::from_reason(format!("NCryptOpenKey failed for '{}': {}", key_name, e))
+        })?;
+    }
 
-    unsafe { let _ = NCryptFreeObject(provider); }
-
-    result.map_err(|e| {
-        Error::from_reason(format!("NCryptOpenKey failed for '{}': {}", key_name, e))
-    })?;
-
-    Ok(key_handle)
+    Ok(NcryptHandle(NCRYPT_HANDLE(key_handle.0)))
 }
 
 fn tpm_key_exists(key_name: &str) -> Result<bool> {
-    match open_key(key_name) {
-        Ok(handle) => {
-            unsafe { let _ = NCryptFreeObject(handle); }
-            Ok(true)
-        }
-        Err(_) => Ok(false),
-    }
+    Ok(open_key(key_name).is_ok())
 }
 
 fn load_and_export_key(key_name: &str, label: &str) -> Result<GeneratedKey> {
-    let key_handle = open_key(key_name)?;
-    let public_jwk = export_public_jwk(key_handle)?;
-    unsafe { let _ = NCryptFreeObject(key_handle); }
+    let key = open_key(key_name)?;
+    let public_jwk = export_public_jwk(&key)?;
 
     Ok(GeneratedKey {
         backend: "windows-tpm".to_string(),
@@ -351,13 +341,15 @@ fn load_and_export_key(key_name: &str, label: &str) -> Result<GeneratedKey> {
     })
 }
 
-fn export_public_jwk(key_handle: NCRYPT_KEY_HANDLE) -> Result<String> {
+/// Export the public key from a CNG key handle and convert to JWK.
+/// Uses two-call pattern: first query size, then export.
+fn export_public_jwk(key: &NcryptHandle) -> Result<String> {
     let blob_type = HSTRING::from("ECCPUBLICBLOB");
     let mut export_len: u32 = 0;
 
     unsafe {
         NCryptExportKey(
-            key_handle,
+            key.as_key(),
             NCRYPT_KEY_HANDLE::default(),
             &blob_type,
             None,
@@ -372,7 +364,7 @@ fn export_public_jwk(key_handle: NCRYPT_KEY_HANDLE) -> Result<String> {
 
     unsafe {
         NCryptExportKey(
-            key_handle,
+            key.as_key(),
             NCRYPT_KEY_HANDLE::default(),
             &blob_type,
             None,
@@ -387,9 +379,9 @@ fn export_public_jwk(key_handle: NCRYPT_KEY_HANDLE) -> Result<String> {
     eccpublic_blob_to_jwk(&blob)
 }
 
-/// Convert BCRYPT_ECCPUBLIC_BLOB to JWK.
+/// Convert `BCRYPT_ECCPUBLIC_BLOB` to JWK.
 ///
-/// Layout: DWORD dwMagic (4) | DWORD cbKey (4) | BYTE X[cbKey] | BYTE Y[cbKey]
+/// Layout: `DWORD dwMagic (4) | DWORD cbKey (4) | BYTE X[cbKey] | BYTE Y[cbKey]`
 fn eccpublic_blob_to_jwk(blob: &[u8]) -> Result<String> {
     if blob.len() < 8 {
         return Err(Error::from_reason("ECCPUBLIC blob too short"));

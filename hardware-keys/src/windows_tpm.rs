@@ -124,7 +124,7 @@ pub fn generate_key(
         match on_duplicate {
             DuplicateLabelPolicy::Replace => delete_key(label)?,
             // get-or-create: return existing key
-            DuplicateLabelPolicy::Error => return load_and_export_key(&key_name, label),
+            DuplicateLabelPolicy::Error => return load_and_export_key(&key_name),
         }
     }
 
@@ -137,8 +137,8 @@ pub fn generate_key(
             &mut key_handle,
             &HSTRING::from("ECDSA_P256"),
             &HSTRING::from(key_name.as_str()),
-            CERT_KEY_SPEC(0),
-            NCRYPT_FLAGS(0),
+            CERT_KEY_SPEC::default(),
+            NCRYPT_SILENT_FLAG, // prevent CNG from showing its own UI dialog
         )
         .map_err(|e| Error::from_reason(format!("NCryptCreatePersistedKey failed: {}", e)))?;
     }
@@ -146,7 +146,7 @@ pub fn generate_key(
     let key = NcryptHandle(NCRYPT_HANDLE(key_handle.0));
 
     unsafe {
-        NCryptFinalizeKey(key.as_key(), NCRYPT_FLAGS(0))
+        NCryptFinalizeKey(key.as_key(), NCRYPT_SILENT_FLAG) // fail closed (NTE_SILENT_CONTEXT) rather than show dialog
             .map_err(|e| Error::from_reason(format!("NCryptFinalizeKey failed: {}", e)))?;
     }
 
@@ -188,7 +188,7 @@ fn sign_hash_with_options(key_id: &str, hash: &[u8], require_biometric: bool) ->
             hash,
             None,
             &mut sig_len,
-            NCRYPT_FLAGS(0),
+            NCRYPT_FLAGS::default(),
         )
         .map_err(|e| Error::from_reason(format!("NCryptSignHash (size query) failed: {}", e)))?;
     }
@@ -203,7 +203,7 @@ fn sign_hash_with_options(key_id: &str, hash: &[u8], require_biometric: bool) ->
             hash,
             Some(&mut sig_buf),
             &mut sig_len,
-            NCRYPT_FLAGS(0),
+            NCRYPT_FLAGS::default(),
         )
         .map_err(|e| Error::from_reason(format!("NCryptSignHash failed: {}", e)))?;
     }
@@ -338,11 +338,15 @@ fn hello_verify(reason: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn open_provider() -> Result<NcryptHandle> {
+    let provider_name: Vec<u16> = MS_PLATFORM_CRYPTO_PROVIDER
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let mut provider = NCRYPT_PROV_HANDLE::default();
     unsafe {
         NCryptOpenStorageProvider(
             &mut provider,
-            &HSTRING::from(MS_PLATFORM_CRYPTO_PROVIDER),
+            PCWSTR(provider_name.as_ptr()),
             0,
         )
         .map_err(|e| Error::from_reason(format!("NCryptOpenStorageProvider failed: {}", e)))?;
@@ -359,7 +363,7 @@ fn open_key(key_name: &str) -> Result<NcryptHandle> {
             provider.as_prov(),
             &mut key_handle,
             &HSTRING::from(key_name),
-            CERT_KEY_SPEC(0),
+            CERT_KEY_SPEC::default(),
             NCRYPT_SILENT_FLAG,
         )
         .map_err(|e| {
@@ -398,7 +402,7 @@ fn export_public_jwk(key: &NcryptHandle) -> Result<String> {
             None,
             None,
             &mut export_len,
-            NCRYPT_FLAGS(0),
+            NCRYPT_FLAGS::default(),
         )
         .map_err(|e| Error::from_reason(format!("NCryptExportKey (size) failed: {}", e)))?;
     }
@@ -413,7 +417,7 @@ fn export_public_jwk(key: &NcryptHandle) -> Result<String> {
             None,
             Some(&mut blob),
             &mut export_len,
-            NCRYPT_FLAGS(0),
+            NCRYPT_FLAGS::default(),
         )
         .map_err(|e| Error::from_reason(format!("NCryptExportKey failed: {}", e)))?;
     }

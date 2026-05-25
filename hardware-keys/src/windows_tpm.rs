@@ -19,7 +19,6 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use napi::bindgen_prelude::*;
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Security::Cryptography::*;
-use std::thread;
 use windows::Security::Credentials::UI::{
     UserConsentVerificationResult, UserConsentVerifier,
     UserConsentVerifierAvailability,
@@ -326,57 +325,39 @@ fn hello_available() -> bool {
 /// `Err` on cancellation, device not present, policy disabled, or retries exhausted.
 fn hello_verify(reason: &str) -> Result<()> {
     let reason = reason.to_string();
-    run_on_sta(move || prompt_user_consent(&reason))
-}
+    run_on_sta(move || {
+        let reason_h = HSTRING::from(reason.as_str());
+        let async_op = UserConsentVerifier::RequestVerificationAsync(&reason_h)
+            .map_err(|e| Error::from_reason(format!("RequestVerificationAsync failed: {e}")))?;
+        let result = async_op
+            .get()
+            .map_err(|e| Error::from_reason(format!("UserConsentVerifier async wait: {e}")))?;
 
-/// Fire the Hello biometric/PIN prompt synchronously. Returns `Ok(())`
-/// on `Verified`; otherwise returns an `Error::KeyOperation` describing
-/// why the verification did not succeed (user cancelled, device busy,
-/// disabled by policy, etc.).
-fn prompt_user_consent(reason: &str) -> Result<()> {
-    let reason_h = HSTRING::from(reason);
-    let async_op = UserConsentVerifier::RequestVerificationAsync(&reason_h).map_err(|e| {
-        Error::KeyOperation {
-            operation: "hello_request_verification".into(),
-            detail: format!("UserConsentVerifier::RequestVerificationAsync: {e}"),
+        match result {
+            UserConsentVerificationResult::Verified => Ok(()),
+            UserConsentVerificationResult::DeviceNotPresent => {
+                Err(Error::from_reason("Windows Hello device not present (DeviceNotPresent)"))
+            }
+            UserConsentVerificationResult::NotConfiguredForUser => {
+                Err(Error::from_reason("Windows Hello not configured for this user"))
+            }
+            UserConsentVerificationResult::DisabledByPolicy => {
+                Err(Error::from_reason("Windows Hello disabled by policy"))
+            }
+            UserConsentVerificationResult::DeviceBusy => {
+                Err(Error::from_reason("Windows Hello device is busy; try again"))
+            }
+            UserConsentVerificationResult::RetriesExhausted => {
+                Err(Error::from_reason("Windows Hello retries exhausted"))
+            }
+            UserConsentVerificationResult::Canceled => {
+                Err(Error::from_reason("User cancelled Windows Hello verification"))
+            }
+            other => Err(Error::from_reason(format!(
+                "UserConsentVerifier unexpected result: {other:?}"
+            ))),
         }
-    })?;
-    let result = async_op.get().map_err(|e| Error::KeyOperation {
-        operation: "hello_await_result".into(),
-        detail: format!("UserConsentVerifier async wait: {e}"),
-    })?;
-
-    match result {
-        UserConsentVerificationResult::Verified => Ok(()),
-        UserConsentVerificationResult::DeviceNotPresent => Err(Error::KeyOperation {
-            operation: "hello_request_verification".into(),
-            detail: "Windows Hello is not configured for this user (DeviceNotPresent)".into(),
-        }),
-        UserConsentVerificationResult::NotConfiguredForUser => Err(Error::KeyOperation {
-            operation: "hello_request_verification".into(),
-            detail: "Windows Hello is not configured for this user (NotConfiguredForUser)".into(),
-        }),
-        UserConsentVerificationResult::DisabledByPolicy => Err(Error::KeyOperation {
-            operation: "hello_request_verification".into(),
-            detail: "Windows Hello is disabled by policy".into(),
-        }),
-        UserConsentVerificationResult::DeviceBusy => Err(Error::KeyOperation {
-            operation: "hello_request_verification".into(),
-            detail: "Windows Hello device is busy; try again".into(),
-        }),
-        UserConsentVerificationResult::RetriesExhausted => Err(Error::KeyOperation {
-            operation: "hello_request_verification".into(),
-            detail: "Windows Hello retries exhausted; user could not be verified".into(),
-        }),
-        UserConsentVerificationResult::Canceled => Err(Error::KeyOperation {
-            operation: "hello_request_verification".into(),
-            detail: "User cancelled Windows Hello verification".into(),
-        }),
-        other => Err(Error::KeyOperation {
-            operation: "hello_request_verification".into(),
-            detail: format!("UserConsentVerifier returned unexpected result {other:?}"),
-        }),
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------

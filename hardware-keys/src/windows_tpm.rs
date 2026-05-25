@@ -6,15 +6,28 @@
 ///
 /// Key naming convention: `hwkey-<label>` (e.g. `hwkey-signing-key`)
 /// Backend identifier: `"windows-tpm"`
+///
+/// ## Windows Hello
+///
+/// When `require_biometric: true`, Windows Hello is prompted via
+/// `Windows.Security.Credentials.UI.UserConsentVerifier` before `sign_hash`.
+/// The key itself is created without `NCRYPT_UI_POLICY` so CNG never shows
+/// its own legacy CryptUI password dialog. The Hello prompt is surfaced at the
+/// application level — this is a soft gate (same-UID attacker with code execution
+/// can hook the result), but delivers proper biometric UX on Hello-enrolled hosts.
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use napi::bindgen_prelude::*;
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Security::Cryptography::*;
+use windows::Security::Credentials::UI::{
+    UserConsentVerificationResult, UserConsentVerifier,
+    UserConsentVerifierAvailability,
+};
 
 use crate::{GeneratedKey, HardwareKeyInfo, SignatureResult};
 
 const KEY_NAME_PREFIX: &str = "hwkey-";
-const MS_PLATFORM_CRYPTO_PROVIDER: &str = "Microsoft Platform Crypto Provider";
+const KEY_NAME_PREFIX_BIO: &str = "hwkey-bio-";
 
 pub enum DuplicateLabelPolicy {
     Replace,
@@ -22,7 +35,7 @@ pub enum DuplicateLabelPolicy {
 }
 
 // ---------------------------------------------------------------------------
-// RAII handle wrapper — mirrors enclaveapp-windows/provider.rs NcryptHandle
+// RAII handle wrapper
 // ---------------------------------------------------------------------------
 
 struct NcryptHandle(NCRYPT_HANDLE);
@@ -73,13 +86,13 @@ pub fn discover() -> Option<HardwareKeyInfo> {
 /// # Parameters
 /// - `label`              – Key name stored in CNG as `hwkey-<label>`.
 /// - `algorithm`          – Only `"ES256"` is supported.
-/// - `require_biometric`  – When `true`, sets `NCRYPT_UI_FORCE_HIGH_PROTECTION_FLAG`
-///                          requiring Windows Hello authentication before every signing
-///                          operation. Key creation fails rather than silently creating
-///                          an unprotected key if the policy cannot be applied.
+/// - `require_biometric`  – When `true`, Windows Hello will be prompted via
+///                          `UserConsentVerifier` before every `sign_hash` call.
+///                          The key itself is created without any CNG UI policy —
+///                          the Hello gate is enforced at the application level.
 /// - `on_duplicate`       – Controls behaviour when a key with the same label already
-///                          exists in the TPM. `Error` performs get-or-create (returns
-///                          the existing key); `Replace` deletes and re-creates.
+///                          exists. `Error` performs get-or-create; `Replace` deletes
+///                          and re-creates.
 pub fn generate_key(
     label: &str,
     algorithm: &str,
@@ -92,7 +105,20 @@ pub fn generate_key(
         ));
     }
 
-    let key_name = format!("{}{}", KEY_NAME_PREFIX, label);
+    // Verify Windows Hello is available before creating a biometric-gated key.
+    // Fail hard rather than silently create a key that can never be used with Hello.
+    if require_biometric && !hello_available() {
+        return Err(Error::from_reason(
+            "Windows Hello is not configured for this user. \
+             Set up a PIN or biometric in Windows Settings before creating a biometric-gated key.",
+        ));
+    }
+
+    let key_name = if require_biometric {
+        format!("{}{}", KEY_NAME_PREFIX_BIO, label)
+    } else {
+        format!("{}{}", KEY_NAME_PREFIX, label)
+    };
 
     if tpm_key_exists(&key_name)? {
         match on_duplicate {
@@ -117,52 +143,7 @@ pub fn generate_key(
         .map_err(|e| Error::from_reason(format!("NCryptCreatePersistedKey failed: {}", e)))?;
     }
 
-    // Wrap immediately so handle is freed on any early return
     let key = NcryptHandle(NCRYPT_HANDLE(key_handle.0));
-
-    // Set Windows Hello UI policy if biometric requested.
-    // NCRYPT_UI_FORCE_HIGH_PROTECTION_FLAG prompts Windows Hello on every sign,
-    // not on key creation. Fail hard rather than silently create an unprotected key.
-    if require_biometric {
-        // These strings are shown in the Windows Hello prompt UI.
-        // Must be kept alive for the duration of NCryptSetProperty.
-        let creation_title: Vec<u16> = "Hardware Key Authentication\0"
-            .encode_utf16().collect();
-        let friendly_name: Vec<u16> = format!("hwkey-{}\0", label)
-            .encode_utf16().collect();
-        let description: Vec<u16> = "Windows Hello is required to use this key\0"
-            .encode_utf16().collect();
-
-        let policy = NCRYPT_UI_POLICY {
-            dwVersion: 1,
-            dwFlags: NCRYPT_UI_FORCE_HIGH_PROTECTION_FLAG,
-            pszCreationTitle: PCWSTR(creation_title.as_ptr()),
-            pszFriendlyName: PCWSTR(friendly_name.as_ptr()),
-            pszDescription: PCWSTR(description.as_ptr()),
-        };
-
-        unsafe {
-            NCryptSetProperty(
-                key.as_key(),
-                &HSTRING::from("UI Policy"),
-                std::slice::from_raw_parts(
-                    &policy as *const _ as *const u8,
-                    std::mem::size_of::<NCRYPT_UI_POLICY>(),
-                ),
-                NCRYPT_FLAGS(0),
-            )
-            .map_err(|e| {
-                Error::from_reason(format!(
-                    "Failed to set Windows Hello UI policy: {}. \
-                     TPM key creation aborted to avoid creating unprotected key.",
-                    e
-                ))
-            })?;
-        }
-
-        // Explicitly keep the string buffers alive past NCryptSetProperty
-        drop((creation_title, friendly_name, description));
-    }
 
     unsafe {
         NCryptFinalizeKey(key.as_key(), NCRYPT_FLAGS(0))
@@ -173,17 +154,30 @@ pub fn generate_key(
 
     Ok(GeneratedKey {
         backend: "windows-tpm".to_string(),
-        key_id: label.to_string(),
+        key_id: key_name, // full key_id: "hwkey-<label>" or "hwkey-bio-<label>"
         algorithm: "ES256".to_string(),
         public_jwk,
     })
 }
 
 /// Sign a SHA-256 hash with a TPM key.
-/// CNG returns a P1363 signature (r ‖ s, 64 bytes) directly for ECDSA — no padding info needed.
+///
+/// `key_id` is the full key name returned by `generate_key`:
+/// - `"hwkey-<label>"` — no biometric, signs immediately.
+/// - `"hwkey-bio-<label>"` — prompts Windows Hello before signing.
 pub fn sign_hash(key_id: &str, hash: &[u8]) -> Result<SignatureResult> {
-    let key_name = format!("{}{}", KEY_NAME_PREFIX, key_id);
-    let key = open_key(&key_name)?;
+    let require_biometric = key_id.starts_with(KEY_NAME_PREFIX_BIO);
+    sign_hash_with_options(key_id, hash, require_biometric)
+}
+
+fn sign_hash_with_options(key_id: &str, hash: &[u8], require_biometric: bool) -> Result<SignatureResult> {
+    if require_biometric {
+        let reason = format!("Authenticate to sign with key '{}'", key_id);
+        hello_verify(&reason)?;
+    }
+
+    // key_id is already the full CNG key name (e.g. "hwkey-signing-key" or "hwkey-bio-signing-key")
+    let key = open_key(key_id)?;
 
     // First call: query required signature buffer size
     let mut sig_len: u32 = 0;
@@ -201,7 +195,7 @@ pub fn sign_hash(key_id: &str, hash: &[u8]) -> Result<SignatureResult> {
 
     let mut sig_buf = vec![0u8; sig_len as usize];
 
-    // Second call: actual sign — Windows Hello prompt fires here if biometric policy is set
+    // Second call: actual sign
     unsafe {
         NCryptSignHash(
             key.as_key(),
@@ -249,15 +243,16 @@ pub fn list_keys() -> Result<Vec<GeneratedKey>> {
                     };
                     unsafe { let _ = NCryptFreeBuffer(key_name_ptr as *mut _); }
 
-                    if let Some(label) = name.strip_prefix(KEY_NAME_PREFIX) {
-                        if let Ok(entry) = load_and_export_key(&name, label) {
+                    // key_id is the full CNG name; only include keys managed by this library
+                    if name.starts_with(KEY_NAME_PREFIX) {
+                        if let Ok(entry) = load_and_export_key(&name) {
                             keys.push(entry);
                         }
                     }
                 }
             }
             Err(e) if e.code() == windows::Win32::Foundation::NTE_NO_MORE_ITEMS.into() => break,
-            Err(_) => break, // any other error ends enumeration gracefully
+            Err(_) => break,
         }
     }
 
@@ -268,15 +263,13 @@ pub fn list_keys() -> Result<Vec<GeneratedKey>> {
     Ok(keys)
 }
 
-/// Delete a TPM key by label.
-/// Note: `NCryptDeleteKey` takes ownership of the handle and frees it — do NOT wrap in NcryptHandle.
-pub fn delete_key(label: &str) -> Result<()> {
-    let key_name = format!("{}{}", KEY_NAME_PREFIX, label);
-    let key = open_key(&key_name).map_err(|_| {
-        Error::from_reason(format!("Key not found for label: '{}'", label))
+/// Delete a TPM key by its full key_id (e.g. `"hwkey-signing-key"` or `"hwkey-bio-signing-key"`).
+/// `NCryptDeleteKey` takes ownership of the handle — must NOT wrap in NcryptHandle.
+pub fn delete_key(key_id: &str) -> Result<()> {
+    let key = open_key(key_id).map_err(|_| {
+        Error::from_reason(format!("Key not found for key_id: '{}'", key_id))
     })?;
 
-    // NCryptDeleteKey takes ownership — must not let NcryptHandle drop call NCryptFreeObject again
     let raw = key.as_key();
     std::mem::forget(key);
 
@@ -286,6 +279,58 @@ pub fn delete_key(label: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Windows Hello helpers
+// ---------------------------------------------------------------------------
+
+/// Check whether Windows Hello (PIN or biometric) is configured for the current user.
+fn hello_available() -> bool {
+    let async_op = match UserConsentVerifier::CheckAvailabilityAsync() {
+        Ok(op) => op,
+        Err(_) => return false,
+    };
+    match async_op.get() {
+        Ok(r) => matches!(r, UserConsentVerifierAvailability::Available),
+        Err(_) => false,
+    }
+}
+
+/// Prompt Windows Hello synchronously. Returns `Ok(())` on `Verified`,
+/// `Err` on cancellation, device not present, policy disabled, or retries exhausted.
+fn hello_verify(reason: &str) -> Result<()> {
+    let reason_h = HSTRING::from(reason);
+    let async_op = UserConsentVerifier::RequestVerificationAsync(&reason_h)
+        .map_err(|e| Error::from_reason(format!("UserConsentVerifier unavailable: {}", e)))?;
+
+    let result = async_op.get()
+        .map_err(|e| Error::from_reason(format!("Windows Hello prompt failed: {}", e)))?;
+
+    match result {
+        UserConsentVerificationResult::Verified => Ok(()),
+        UserConsentVerificationResult::Canceled => {
+            Err(Error::from_reason("Windows Hello: user cancelled authentication"))
+        }
+        UserConsentVerificationResult::DeviceNotPresent => {
+            Err(Error::from_reason("Windows Hello: device not present"))
+        }
+        UserConsentVerificationResult::NotConfiguredForUser => {
+            Err(Error::from_reason("Windows Hello: not configured for this user"))
+        }
+        UserConsentVerificationResult::DisabledByPolicy => {
+            Err(Error::from_reason("Windows Hello: disabled by policy"))
+        }
+        UserConsentVerificationResult::DeviceBusy => {
+            Err(Error::from_reason("Windows Hello: device busy, try again"))
+        }
+        UserConsentVerificationResult::RetriesExhausted => {
+            Err(Error::from_reason("Windows Hello: retries exhausted"))
+        }
+        other => Err(Error::from_reason(format!(
+            "Windows Hello: unexpected result {:?}", other
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -329,20 +374,18 @@ fn tpm_key_exists(key_name: &str) -> Result<bool> {
     Ok(open_key(key_name).is_ok())
 }
 
-fn load_and_export_key(key_name: &str, label: &str) -> Result<GeneratedKey> {
-    let key = open_key(key_name)?;
+fn load_and_export_key(key_id: &str) -> Result<GeneratedKey> {
+    let key = open_key(key_id)?;
     let public_jwk = export_public_jwk(&key)?;
 
     Ok(GeneratedKey {
         backend: "windows-tpm".to_string(),
-        key_id: label.to_string(),
+        key_id: key_id.to_string(), // full key_id preserved
         algorithm: "ES256".to_string(),
         public_jwk,
     })
 }
 
-/// Export the public key from a CNG key handle and convert to JWK.
-/// Uses two-call pattern: first query size, then export.
 fn export_public_jwk(key: &NcryptHandle) -> Result<String> {
     let blob_type = HSTRING::from("ECCPUBLICBLOB");
     let mut export_len: u32 = 0;
@@ -380,7 +423,6 @@ fn export_public_jwk(key: &NcryptHandle) -> Result<String> {
 }
 
 /// Convert `BCRYPT_ECCPUBLIC_BLOB` to JWK.
-///
 /// Layout: `DWORD dwMagic (4) | DWORD cbKey (4) | BYTE X[cbKey] | BYTE Y[cbKey]`
 fn eccpublic_blob_to_jwk(blob: &[u8]) -> Result<String> {
     if blob.len() < 8 {

@@ -19,6 +19,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use napi::bindgen_prelude::*;
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Security::Cryptography::*;
+use std::thread;
 use windows::Security::Credentials::UI::{
     UserConsentVerificationResult, UserConsentVerifier,
     UserConsentVerifierAvailability,
@@ -290,52 +291,91 @@ pub fn delete_key(key_id: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Windows Hello helpers
 // ---------------------------------------------------------------------------
+fn run_on_sta<F, T>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+            );
+        }
+        let result = f();
+        unsafe { windows::Win32::System::Com::CoUninitialize(); }
+        let _ = tx.send(result);
+    });
+    rx.recv().map_err(|_| Error::from_reason("STA thread died"))?
+}
 
 /// Check whether Windows Hello (PIN or biometric) is configured for the current user.
 fn hello_available() -> bool {
-    let async_op = match UserConsentVerifier::CheckAvailabilityAsync() {
-        Ok(op) => op,
-        Err(_) => return false,
-    };
-    match async_op.get() {
-        Ok(r) => matches!(r, UserConsentVerifierAvailability::Available),
-        Err(_) => false,
-    }
+    run_on_sta(|| {
+        let async_op = UserConsentVerifier::CheckAvailabilityAsync()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let result = async_op.get()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(matches!(result, UserConsentVerifierAvailability::Available))
+    }).unwrap_or(false)
 }
 
 /// Prompt Windows Hello synchronously. Returns `Ok(())` on `Verified`,
 /// `Err` on cancellation, device not present, policy disabled, or retries exhausted.
 fn hello_verify(reason: &str) -> Result<()> {
-    let reason_h = HSTRING::from(reason);
-    let async_op = UserConsentVerifier::RequestVerificationAsync(&reason_h)
-        .map_err(|e| Error::from_reason(format!("UserConsentVerifier unavailable: {}", e)))?;
+    let reason = reason.to_string();
+    run_on_sta(move || prompt_user_consent(&reason))
+}
 
-    let result = async_op.get()
-        .map_err(|e| Error::from_reason(format!("Windows Hello prompt failed: {}", e)))?;
+/// Fire the Hello biometric/PIN prompt synchronously. Returns `Ok(())`
+/// on `Verified`; otherwise returns an `Error::KeyOperation` describing
+/// why the verification did not succeed (user cancelled, device busy,
+/// disabled by policy, etc.).
+fn prompt_user_consent(reason: &str) -> Result<()> {
+    let reason_h = HSTRING::from(reason);
+    let async_op = UserConsentVerifier::RequestVerificationAsync(&reason_h).map_err(|e| {
+        Error::KeyOperation {
+            operation: "hello_request_verification".into(),
+            detail: format!("UserConsentVerifier::RequestVerificationAsync: {e}"),
+        }
+    })?;
+    let result = async_op.get().map_err(|e| Error::KeyOperation {
+        operation: "hello_await_result".into(),
+        detail: format!("UserConsentVerifier async wait: {e}"),
+    })?;
 
     match result {
         UserConsentVerificationResult::Verified => Ok(()),
-        UserConsentVerificationResult::Canceled => {
-            Err(Error::from_reason("Windows Hello: user cancelled authentication"))
-        }
-        UserConsentVerificationResult::DeviceNotPresent => {
-            Err(Error::from_reason("Windows Hello: device not present"))
-        }
-        UserConsentVerificationResult::NotConfiguredForUser => {
-            Err(Error::from_reason("Windows Hello: not configured for this user"))
-        }
-        UserConsentVerificationResult::DisabledByPolicy => {
-            Err(Error::from_reason("Windows Hello: disabled by policy"))
-        }
-        UserConsentVerificationResult::DeviceBusy => {
-            Err(Error::from_reason("Windows Hello: device busy, try again"))
-        }
-        UserConsentVerificationResult::RetriesExhausted => {
-            Err(Error::from_reason("Windows Hello: retries exhausted"))
-        }
-        other => Err(Error::from_reason(format!(
-            "Windows Hello: unexpected result {:?}", other
-        ))),
+        UserConsentVerificationResult::DeviceNotPresent => Err(Error::KeyOperation {
+            operation: "hello_request_verification".into(),
+            detail: "Windows Hello is not configured for this user (DeviceNotPresent)".into(),
+        }),
+        UserConsentVerificationResult::NotConfiguredForUser => Err(Error::KeyOperation {
+            operation: "hello_request_verification".into(),
+            detail: "Windows Hello is not configured for this user (NotConfiguredForUser)".into(),
+        }),
+        UserConsentVerificationResult::DisabledByPolicy => Err(Error::KeyOperation {
+            operation: "hello_request_verification".into(),
+            detail: "Windows Hello is disabled by policy".into(),
+        }),
+        UserConsentVerificationResult::DeviceBusy => Err(Error::KeyOperation {
+            operation: "hello_request_verification".into(),
+            detail: "Windows Hello device is busy; try again".into(),
+        }),
+        UserConsentVerificationResult::RetriesExhausted => Err(Error::KeyOperation {
+            operation: "hello_request_verification".into(),
+            detail: "Windows Hello retries exhausted; user could not be verified".into(),
+        }),
+        UserConsentVerificationResult::Canceled => Err(Error::KeyOperation {
+            operation: "hello_request_verification".into(),
+            detail: "User cancelled Windows Hello verification".into(),
+        }),
+        other => Err(Error::KeyOperation {
+            operation: "hello_request_verification".into(),
+            detail: format!("UserConsentVerifier returned unexpected result {other:?}"),
+        }),
     }
 }
 

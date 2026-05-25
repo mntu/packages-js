@@ -87,7 +87,7 @@ pub fn discover() -> Option<HardwareKeyInfo> {
 /// Generate a P-256 key in the TPM.
 ///
 /// # Parameters
-/// - `label`              – Key name stored in CNG as `hwkey-<label>`.
+/// - `label`              – Key name stored in CNG as `hwkey-<label>` or `hwkey-bio-<label>`.
 /// - `algorithm`          – Only `"ES256"` is supported.
 /// - `require_biometric`  – When `true`, Windows Hello will be prompted via
 ///                          `UserConsentVerifier` before every `sign_hash` call.
@@ -125,7 +125,7 @@ pub fn generate_key(
 
     if tpm_key_exists(&key_name)? {
         match on_duplicate {
-            DuplicateLabelPolicy::Replace => delete_key(label)?,
+            DuplicateLabelPolicy::Replace => delete_key(&key_name)?,
             // get-or-create: return existing key
             DuplicateLabelPolicy::Error => return load_and_export_key(&key_name),
         }
@@ -149,10 +149,11 @@ pub fn generate_key(
     let key = NcryptHandle(NCRYPT_HANDLE(key_handle.0));
 
     unsafe {
-        NCryptFinalizeKey(key.as_key(), NCRYPT_SILENT_FLAG) // fail closed (NTE_SILENT_CONTEXT) rather than show dialog
+        // NCRYPT_SILENT_FLAG: fail closed (NTE_SILENT_CONTEXT) rather than show dialog
+        NCryptFinalizeKey(key.as_key(), NCRYPT_SILENT_FLAG)
             .map_err(|e| Error::from_reason(format!("NCryptFinalizeKey failed: {}", e)))?;
     }
-
+    println!("Created with key_name: {}", key_name);
     let public_jwk = export_public_jwk(&key)?;
 
     Ok(GeneratedKey {
@@ -198,7 +199,7 @@ fn sign_hash_with_options(key_id: &str, hash: &[u8], require_biometric: bool) ->
 
     let mut sig_buf = vec![0u8; sig_len as usize];
 
-    // Second call: actual sign
+    // Second call: actual sign — Windows Hello prompt fires before this if biometric
     unsafe {
         NCryptSignHash(
             key.as_key(),
@@ -246,8 +247,9 @@ pub fn list_keys() -> Result<Vec<GeneratedKey>> {
                     };
                     unsafe { let _ = NCryptFreeBuffer(key_name_ptr as *mut _); }
 
-                    // key_id is the full CNG name; only include keys managed by this library
+                    // Only include keys managed by this library (hwkey- or hwkey-bio- prefix)
                     if name.starts_with(KEY_NAME_PREFIX) {
+                        println!("[list_keys] raw pszName: '{}'", name);
                         if let Ok(entry) = load_and_export_key(&name) {
                             keys.push(entry);
                         }
@@ -267,8 +269,9 @@ pub fn list_keys() -> Result<Vec<GeneratedKey>> {
 }
 
 /// Delete a TPM key by its full key_id (e.g. `"hwkey-signing-key"` or `"hwkey-bio-signing-key"`).
-/// `NCryptDeleteKey` takes ownership of the handle — must NOT wrap in NcryptHandle.
+/// `NCryptDeleteKey` takes ownership of the handle — must NOT call NCryptFreeObject after.
 pub fn delete_key(key_id: &str) -> Result<()> {
+    println!("delete_key key_id: '{}'", key_id);
     let key = open_key(key_id).map_err(|_| {
         Error::from_reason(format!("Key not found for key_id: '{}'", key_id))
     })?;
@@ -382,6 +385,7 @@ fn tpm_key_exists(key_name: &str) -> Result<bool> {
 }
 
 fn load_and_export_key(key_id: &str) -> Result<GeneratedKey> {
+    println!("load_and_export_key key_id: '{}'", key_id);
     let key = open_key(key_id)?;
     let public_jwk = export_public_jwk(&key)?;
 

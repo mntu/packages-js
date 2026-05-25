@@ -29,6 +29,9 @@ use crate::{GeneratedKey, HardwareKeyInfo, SignatureResult};
 const KEY_NAME_PREFIX: &str = "hwkey-";
 const KEY_NAME_PREFIX_BIO: &str = "hwkey-bio-";
 
+/// The CNG provider name for TPM-backed keys.
+pub const PLATFORM_PROVIDER: &str = "Microsoft Platform Crypto Provider";
+
 pub enum DuplicateLabelPolicy {
     Replace,
     Error,
@@ -338,20 +341,20 @@ fn hello_verify(reason: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn open_provider() -> Result<NcryptHandle> {
-    let provider_name: Vec<u16> = MS_PLATFORM_CRYPTO_PROVIDER
+    let provider_name: Vec<u16> = PLATFORM_PROVIDER
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    let mut provider = NCRYPT_PROV_HANDLE::default();
+    let mut handle = NCRYPT_PROV_HANDLE::default();
     unsafe {
         NCryptOpenStorageProvider(
-            &mut provider,
+            &mut handle,
             PCWSTR(provider_name.as_ptr()),
             0,
         )
         .map_err(|e| Error::from_reason(format!("NCryptOpenStorageProvider failed: {}", e)))?;
     }
-    Ok(NcryptHandle(NCRYPT_HANDLE(provider.0)))
+    Ok(NcryptHandle(NCRYPT_HANDLE(handle.0)))
 }
 
 fn open_key(key_name: &str) -> Result<NcryptHandle> {

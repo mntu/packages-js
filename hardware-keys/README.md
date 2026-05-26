@@ -48,9 +48,9 @@ const key = generateKey('windows-tpm', 'ES256', 'signing-key', false, false, tru
 // { backend, keyId, algorithm, publicJwk }
 
 // Sign a SHA-256 hash with an existing key
-const result = signHash('yubikey-piv', '9e', hashBuffer)
-const result = signHash('secure-enclave', 'com.myapp.signing-key', hashBuffer)
-const result = signHash('windows-tpm', 'signing-key', hashBuffer)
+const result = await signHash('yubikey-piv', '9e', hashBuffer)
+const result = await signHash('secure-enclave', 'com.myapp.signing-key', hashBuffer)
+const result = await signHash('windows-tpm', 'signing-key', hashBuffer)
 // { signature: Buffer, algorithm: 'ES256' }
 // Note: signature is always raw P1363 format (r || s, 64 bytes) for ES256
 
@@ -211,7 +211,7 @@ const keys = listKeys('windows-tpm')
 
 // Sign
 const hash = crypto.createHash('sha256').update(payload).digest()
-const { signature } = signHash('windows-tpm', 'signing-key', hash)
+const { signature } = await signHash('windows-tpm', 'signing-key', hash)
 
 // Delete
 deleteKey('windows-tpm', 'signing-key')
@@ -221,31 +221,9 @@ deleteKey('windows-tpm', 'signing-key')
 
 Unlike macOS, Windows CNG keys stored in the TPM Platform Crypto Provider can be inspected externally using PowerShell or `certutil`.
 
-**PowerShell — check if a specific key exists:**
-```powershell
-try {
-    $key = [System.Security.Cryptography.CngKey]::Open(
-        "hwkey-signing-key",
-        [System.Security.Cryptography.CngProvider]::MicrosoftPlatformCryptoProvider
-    )
-    Write-Host "Key exists: $($key.KeyName), algorithm: $($key.Algorithm)"
-    $key.Dispose()
-} catch {
-    Write-Host "Key not found"
-}
-```
-
-**PowerShell — list all `hwkey-` keys in the TPM:**
-```powershell
-$provider = [System.Security.Cryptography.CngProvider]::MicrosoftPlatformCryptoProvider
-[System.Security.Cryptography.CngKey]::GetAllKeys($provider) |
-    Where-Object { $_.KeyName -like "hwkey-*" } |
-    Select-Object KeyName, Algorithm, KeySize
-```
-
 **certutil (Command Prompt):**
 ```cmd
-certutil -csp "Microsoft Platform Crypto Provider" -key
+certutil -csp "Microsoft Platform Crypto Provider" -key -user
 ```
 
 If the key exists, you will see its name (e.g. `hwkey-signing-key`) in the output under the Microsoft Platform Crypto Provider section. If it is absent, the key has not been created or has been deleted.

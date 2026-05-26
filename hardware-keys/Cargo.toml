@@ -10,6 +10,8 @@ crate-type = ["cdylib"]
 [dependencies]
 napi = { version = "2", features = ["napi4", "async", "tokio_rt"] }
 napi-derive = "2"
+tokio = "1.32.0"
+futures = "0.3.28"
 yubikey = { version = "0.8", features = ["untested"] }
 p256 = "0.13"
 der = "0.7"
@@ -25,11 +27,13 @@ core-foundation-sys = "0.8"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
+    "Foundation",
+    "Security_Credentials_UI",
     "Win32_Security_Cryptography",
     "Win32_System_Com",
     "Win32_Foundation",
     "Win32_System_Memory",
-    "Security_Credentials_UI",
+    "Win32_System_WinRT",
 ] }
 
 [build-dependencies]

@@ -267,7 +267,7 @@ async fn hello_verify(reason: &str) -> Result<()> {
 
     let result = UserConsentVerifier::RequestVerificationAsync(&reason_h)
         .map_err(|e| Error::from_reason(format!("RequestVerificationAsync failed: {e}")))?
-        .await  // <-- đây là điểm mấu chốt, không dùng .get()
+        .await
         .map_err(|e| Error::from_reason(format!("UserConsentVerifier await failed: {e}")))?;
 
     match result {

@@ -131,13 +131,13 @@ pub fn generate_key(
 /// Sign a hash with a hardware key.
 /// For JWT: pass the SHA-256 hash of the `header.payload` string.
 #[napi]
-pub fn sign_hash(backend: String, key_id: String, hash: Buffer) -> Result<SignatureResult> {
+pub async fn sign_hash(backend: String, key_id: String, hash: Buffer) -> Result<SignatureResult> {
     match backend.as_str() {
         "yubikey-piv" => yubikey_piv::sign_hash(&key_id, &hash),
         #[cfg(target_os = "macos")]
         "secure-enclave" => secure_enclave::sign_hash(&key_id, &hash),
         #[cfg(target_os = "windows")]
-        "windows-tpm" => windows_tpm::sign_hash(&key_id, &hash),
+        "windows-tpm" => windows_tpm::sign_hash(&key_id, &hash).await,
         _ => Err(Error::from_reason(format!("Unknown backend: {}", backend))),
     }
 }

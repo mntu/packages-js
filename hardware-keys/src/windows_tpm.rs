@@ -110,7 +110,7 @@ pub fn generate_key(
 
     // Verify Windows Hello is available before creating a biometric-gated key.
     // Fail hard rather than silently create a key that can never be used with Hello.
-    if require_biometric && !hello_available() {
+    if require_biometric && !hello_available_sync() {
         return Err(Error::from_reason(
             "Windows Hello is not configured for this user. \
              Set up a PIN or biometric in Windows Settings before creating a biometric-gated key.",
@@ -153,6 +153,7 @@ pub fn generate_key(
         NCryptFinalizeKey(key.as_key(), NCRYPT_SILENT_FLAG)
             .map_err(|e| Error::from_reason(format!("NCryptFinalizeKey failed: {}", e)))?;
     }
+
     println!("Created with key_name: {}", key_name);
     let public_jwk = export_public_jwk(&key)?;
 
@@ -164,60 +165,17 @@ pub fn generate_key(
     })
 }
 
-/// Sign a SHA-256 hash with a TPM key.
-///
-/// `key_id` is the full key name returned by `generate_key`:
-/// - `"hwkey-<label>"` — no biometric, signs immediately.
-/// - `"hwkey-bio-<label>"` — prompts Windows Hello before signing.
-pub fn sign_hash(key_id: &str, hash: &[u8]) -> Result<SignatureResult> {
+/// Sign a SHA-256 hash with a TPM key — async để Windows Hello có thể hiển thị UI.
+/// Caller phải là napi `async fn` hoặc dùng `tokio::spawn`.
+pub async fn sign_hash(key_id: &str, hash: &[u8]) -> Result<SignatureResult> {
     let require_biometric = key_id.starts_with(KEY_NAME_PREFIX_BIO);
-    sign_hash_with_options(key_id, hash, require_biometric)
-}
 
-fn sign_hash_with_options(key_id: &str, hash: &[u8], require_biometric: bool) -> Result<SignatureResult> {
     if require_biometric {
         let reason = format!("Authenticate to sign with key '{}'", key_id);
-        hello_verify(&reason)?;
+        hello_verify(&reason).await?;
     }
 
-    // key_id is already the full CNG key name (e.g. "hwkey-signing-key" or "hwkey-bio-signing-key")
-    let key = open_key(key_id)?;
-
-    // First call: query required signature buffer size
-    let mut sig_len: u32 = 0;
-    unsafe {
-        NCryptSignHash(
-            key.as_key(),
-            None,
-            hash,
-            None,
-            &mut sig_len,
-            NCRYPT_FLAGS::default(),
-        )
-        .map_err(|e| Error::from_reason(format!("NCryptSignHash (size query) failed: {}", e)))?;
-    }
-
-    let mut sig_buf = vec![0u8; sig_len as usize];
-
-    // Second call: actual sign — Windows Hello prompt fires before this if biometric
-    unsafe {
-        NCryptSignHash(
-            key.as_key(),
-            None,
-            hash,
-            Some(&mut sig_buf),
-            &mut sig_len,
-            NCRYPT_FLAGS::default(),
-        )
-        .map_err(|e| Error::from_reason(format!("NCryptSignHash failed: {}", e)))?;
-    }
-
-    sig_buf.truncate(sig_len as usize);
-
-    Ok(SignatureResult {
-        signature: sig_buf.into(),
-        algorithm: "ES256".to_string(),
-    })
+    sign_hash_sync(key_id, hash)
 }
 
 /// List all TPM keys with the `hwkey-` prefix.
@@ -290,79 +248,95 @@ pub fn delete_key(key_id: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Windows Hello helpers
 // ---------------------------------------------------------------------------
-fn run_on_sta<F, T>(f: F) -> Result<T>
-where
-    F: FnOnce() -> Result<T> + Send + 'static,
-    T: Send + 'static,
-{
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        unsafe {
-            let _ = windows::Win32::System::Com::CoInitializeEx(
-                None,
-                windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
-            );
-        }
-        let result = f();
-        unsafe { windows::Win32::System::Com::CoUninitialize(); }
-        let _ = tx.send(result);
-    });
-    rx.recv().map_err(|_| Error::from_reason("STA thread died"))?
-}
 
 /// Check whether Windows Hello (PIN or biometric) is configured for the current user.
-fn hello_available() -> bool {
-    run_on_sta(|| {
-        let async_op = UserConsentVerifier::CheckAvailabilityAsync()
-            .map_err(|e| Error::from_reason(e.to_string()))?;
-        let result = async_op.get()
-            .map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(matches!(result, UserConsentVerifierAvailability::Available))
-    }).unwrap_or(false)
+fn hello_available_sync() -> bool {
+    let Ok(async_op) = UserConsentVerifier::CheckAvailabilityAsync() else {
+        return false;
+    };
+    let Ok(result) = async_op.get() else {
+        return false;
+    };
+    matches!(result, UserConsentVerifierAvailability::Available)
 }
 
 /// Prompt Windows Hello synchronously. Returns `Ok(())` on `Verified`,
 /// `Err` on cancellation, device not present, policy disabled, or retries exhausted.
-fn hello_verify(reason: &str) -> Result<()> {
-    let reason = reason.to_string();
-    run_on_sta(move || {
-        let reason_h = HSTRING::from(reason.as_str());
-        let async_op = UserConsentVerifier::RequestVerificationAsync(&reason_h)
-            .map_err(|e| Error::from_reason(format!("RequestVerificationAsync failed: {e}")))?;
-        let result = async_op
-            .get()
-            .map_err(|e| Error::from_reason(format!("UserConsentVerifier async wait: {e}")))?;
+async fn hello_verify(reason: &str) -> Result<()> {
+    let reason_h = HSTRING::from(reason);
 
-        match result {
-            UserConsentVerificationResult::Verified => Ok(()),
-            UserConsentVerificationResult::DeviceNotPresent => {
-                Err(Error::from_reason("Windows Hello device not present (DeviceNotPresent)"))
-            }
-            UserConsentVerificationResult::NotConfiguredForUser => {
-                Err(Error::from_reason("Windows Hello not configured for this user"))
-            }
-            UserConsentVerificationResult::DisabledByPolicy => {
-                Err(Error::from_reason("Windows Hello disabled by policy"))
-            }
-            UserConsentVerificationResult::DeviceBusy => {
-                Err(Error::from_reason("Windows Hello device is busy; try again"))
-            }
-            UserConsentVerificationResult::RetriesExhausted => {
-                Err(Error::from_reason("Windows Hello retries exhausted"))
-            }
-            UserConsentVerificationResult::Canceled => {
-                Err(Error::from_reason("User cancelled Windows Hello verification"))
-            }
-            other => Err(Error::from_reason(format!(
-                "UserConsentVerifier unexpected result: {other:?}"
-            ))),
+    let result = UserConsentVerifier::RequestVerificationAsync(&reason_h)
+        .map_err(|e| Error::from_reason(format!("RequestVerificationAsync failed: {e}")))?
+        .await  // <-- đây là điểm mấu chốt, không dùng .get()
+        .map_err(|e| Error::from_reason(format!("UserConsentVerifier await failed: {e}")))?;
+
+    match result {
+        UserConsentVerificationResult::Verified => Ok(()),
+        UserConsentVerificationResult::Canceled => {
+            Err(Error::from_reason("User cancelled Windows Hello verification"))
         }
-    })
+        UserConsentVerificationResult::RetriesExhausted => {
+            Err(Error::from_reason("Windows Hello retries exhausted"))
+        }
+        UserConsentVerificationResult::DeviceNotPresent => {
+            Err(Error::from_reason("Windows Hello device not present"))
+        }
+        UserConsentVerificationResult::NotConfiguredForUser => {
+            Err(Error::from_reason("Windows Hello not configured for this user"))
+        }
+        UserConsentVerificationResult::DisabledByPolicy => {
+            Err(Error::from_reason("Windows Hello disabled by policy"))
+        }
+        UserConsentVerificationResult::DeviceBusy => {
+            Err(Error::from_reason("Windows Hello device is busy; try again"))
+        }
+        other => Err(Error::from_reason(format!(
+            "UserConsentVerifier unexpected result: {other:?}"
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
+
+fn sign_hash_sync(key_id: &str, hash: &[u8]) -> Result<SignatureResult> {
+    let key = open_key(key_id)?;
+
+    let mut sig_len: u32 = 0;
+    unsafe {
+        NCryptSignHash(
+            key.as_key(),
+            None,
+            hash,
+            None,
+            &mut sig_len,
+            NCRYPT_FLAGS::default(),
+        )
+        .map_err(|e| Error::from_reason(format!("NCryptSignHash (size query) failed: {}", e)))?;
+    }
+
+    let mut sig_buf = vec![0u8; sig_len as usize];
+
+    unsafe {
+        NCryptSignHash(
+            key.as_key(),
+            None,
+            hash,
+            Some(&mut sig_buf),
+            &mut sig_len,
+            NCRYPT_FLAGS::default(),
+        )
+        .map_err(|e| Error::from_reason(format!("NCryptSignHash failed: {}", e)))?;
+    }
+
+    sig_buf.truncate(sig_len as usize);
+
+    Ok(SignatureResult {
+        signature: sig_buf.into(),
+        algorithm: "ES256".to_string(),
+    })
+}
 
 fn open_provider() -> Result<NcryptHandle> {
     let provider_name: Vec<u16> = PLATFORM_PROVIDER

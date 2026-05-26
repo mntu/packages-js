@@ -57,7 +57,7 @@ export declare function generateKey(backend: string, algorithm: string, label?: 
  * Sign a hash with a hardware key.
  * For JWT: pass the SHA-256 hash of the `header.payload` string.
  */
-export declare function signHash(backend: string, keyId: string, hash: Buffer): SignatureResult
+export declare function signHash(backend: string, keyId: string, hash: Buffer): Promise<SignatureResult>
 /**
  * List existing keys on a backend.
  *

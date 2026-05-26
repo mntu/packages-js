@@ -8,7 +8,7 @@ license = "MIT"
 crate-type = ["cdylib"]
 
 [dependencies]
-napi = { version = "2", features = ["napi4"] }
+napi = { version = "2", features = ["napi4", "async", "tokio_rt"] }
 napi-derive = "2"
 yubikey = { version = "0.8", features = ["untested"] }
 p256 = "0.13"
